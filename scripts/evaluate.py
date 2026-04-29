@@ -105,6 +105,9 @@ TRAJ_EP_SUMMARY_COLS = [
     "success",
     "reward",
     "length",
+    "stage1_eval_score",
+    "stage1_eval_max_hold_steps",
+    "stage1_eval_possible_steps",
     "min_dist",
     "sim_time_sec",
     "wall_time_sec",
@@ -275,6 +278,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--device",     type=str, default="cpu")
     p.add_argument("--seed",       type=int, default=0)
+    p.add_argument(
+        "--random_seed",
+        action="store_true",
+        help="Use a fresh random base seed for this evaluation run instead of --seed",
+    )
     return p.parse_args()
 
 
@@ -361,6 +369,16 @@ def sanitize_positive_int(value: int, default: int, name: str) -> int:
         return int(default)
 
     return v
+
+
+def resolve_eval_seed(seed: int, random_seed: bool) -> int:
+    """返回本次评估使用的 base seed。"""
+    if random_seed:
+        # os.urandom 不受 numpy/random 全局状态影响，适合作为一次性 run seed。
+        seed = int.from_bytes(os.urandom(4), byteorder="little", signed=False)
+        print(f"[INFO] Random eval seed: {seed}")
+        return seed
+    return int(seed)
 
 
 def _positive_finite_float(value: float, name: str) -> float:
@@ -557,6 +575,8 @@ def evaluate_stage(
         strategy=create_strategy(stage, env_config),
         render_mode=render_mode,
     )
+    if stage == 1:
+        env.set_success_mode("eval")
 
     # GUI 模式下限制循环速度，让推演过程肉眼可观察。
     speed = float(render_speed)
@@ -805,6 +825,13 @@ def evaluate_stage(
 
             success = info.get("episode", {}).get("success", False)
             episode_info = info.get("episode", {})
+            stage1_eval_score = float(episode_info.get("stage1_eval_score", 0.0))
+            stage1_eval_max_hold_steps = int(
+                episode_info.get("stage1_eval_max_hold_steps", 0)
+            )
+            stage1_eval_possible_steps = int(
+                episode_info.get("stage1_eval_possible_steps", 0)
+            )
             ep_wall = max(time.perf_counter() - ep_wall_t0, 1e-9)
             ep_sim = ep_len * env_config.episode.dt
             ep_rate = ep_sim / ep_wall
@@ -826,6 +853,9 @@ def evaluate_stage(
                     "success": int(success),
                     "reward": round(float(ep_r), 6),
                     "length": ep_len,
+                    "stage1_eval_score": round(stage1_eval_score, 3),
+                    "stage1_eval_max_hold_steps": stage1_eval_max_hold_steps,
+                    "stage1_eval_possible_steps": stage1_eval_possible_steps,
                     "min_dist": round(float(min_d), 6),
                     "sim_time_sec": round(float(ep_sim), 6),
                     "wall_time_sec": round(float(ep_wall), 6),
@@ -834,10 +864,17 @@ def evaluate_stage(
                 })
 
             status = "✓ SUCCESS" if success else "✗ FAIL   "
+            eval_suffix = ""
+            if stage == 1:
+                eval_suffix = (
+                    f" | EvalScore={stage1_eval_score:.1f}"
+                    f" | MaxHoldSteps={stage1_eval_max_hold_steps}"
+                )
             print(
                 f"  Ep {ep+1:3d}/{n_episodes} | {status} | "
                 f"R={ep_r:+8.2f} | L={ep_len:4d} | minDist={min_d:.2f}m"
                 f" | rate={ep_rate:.2f}x"
+                f"{eval_suffix}"
             )
     finally:
         if realtime_enabled and plt is not None and rt_fig is not None:
@@ -870,6 +907,7 @@ def evaluate_stage(
                 {
                     "stage": stage,
                     "episodes": n_episodes,
+                    "seed": int(seed),
                     "dt": float(env_config.episode.dt),
                     "max_steps": int(env_config.episode.max_steps),
                     "platform_half_extents": [float(x) for x in platform_half_extents.tolist()],
@@ -904,6 +942,7 @@ def print_summary(results: list) -> None:
 
 def main() -> None:
     args = parse_args()
+    eval_seed = resolve_eval_seed(args.seed, args.random_seed)
 
     env_config = EnvConfig()
     default_eval_max_steps = int(env_config.episode.max_steps)
@@ -962,7 +1001,7 @@ def main() -> None:
                     save_traj=args.save_traj,
                     hover_height=hover_height,
                     render_speed=render_speed,
-                    seed=args.seed,
+                    seed=eval_seed,
                     traj_enable=traj_enable,
                     traj_stage_dir=stage_traj_dir,
                     traj_stride=traj_stride,

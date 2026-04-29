@@ -12,6 +12,14 @@ from curriculum.strategies.base_strategy import CurriculumStrategy, HoverStrateg
 class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
     label = "Hover  | Static Platform"
     short_label = "Hover-Static"
+    episode_metrics = (
+        "stage1_train_score",
+        "stage1_train_hit_steps",
+        "stage1_train_possible_steps",
+        "stage1_eval_score",
+        "stage1_eval_max_hold_steps",
+        "stage1_eval_possible_steps",
+    )
 
     # 位置奖励：水平和高度分离的高斯接近奖励。
     POS_XY_WEIGHT = 3.0
@@ -46,7 +54,13 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
     HOLD_VERT_TOL = 0.08
     HOLD_SPEED_MAX = 0.10
 
-    # 终止塑形。max_steps 截断不再代表成功。
+    # Stage 1 成功判定：训练使用较宽空间的总命中步数，评估使用稳定保持空间的最长连续步数。
+    TRAIN_SUCCESS_RADIUS = 0.20
+    TRAIN_SUCCESS_VERT_TOL = 0.15
+    TRAIN_SUCCESS_SPEED_MAX = 0.15
+    SUCCESS_SCORE_THRESHOLD = 60.0
+
+    # 终止塑形。成功只作为指标，不给额外成功奖励。
     OOB_PENALTY = -100.0
 
     def stage_id(self) -> int:
@@ -76,6 +90,136 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             and vert_err < self.HOLD_VERT_TOL
             and speed < self.HOLD_SPEED_MAX
         )
+
+    @staticmethod
+    def _state_in_box(
+        *,
+        drone_state: Dict[str, np.ndarray],
+        target_pos: np.ndarray,
+        horiz_tol: float,
+        vert_tol: float,
+        speed_max: float,
+    ) -> bool:
+        target_vec = target_pos - drone_state["position"]
+        horiz_err = float(np.linalg.norm(target_vec[:2]))
+        vert_err = abs(float(target_vec[2]))
+        speed = float(np.linalg.norm(drone_state["velocity"]))
+        return horiz_err < horiz_tol and vert_err < vert_tol and speed < speed_max
+
+    def _possible_steps(
+        self,
+        env: Any,
+        drone_state: Dict[str, np.ndarray],
+        platform_state: Dict[str, np.ndarray],
+        *,
+        horiz_tol: float,
+        vert_tol: float,
+    ) -> int:
+        target = self.get_target_pos(platform_state["position"])
+        rel = target - drone_state["position"]
+        horiz_dist = float(np.linalg.norm(rel[:2]))
+        vert_dist = abs(float(rel[2]))
+
+        xy_cap = max(float(env._current_v_xy_max), 1e-6)
+        z_cap = env._current_vz_up_max if rel[2] >= 0.0 else env._current_vz_down_max
+        z_cap = max(float(z_cap), 1e-6)
+
+        entry_xy = max(0.0, horiz_dist - float(horiz_tol))
+        entry_z = max(0.0, vert_dist - float(vert_tol))
+        t_arrive = max(entry_xy / xy_cap, entry_z / z_cap)
+        arrive_steps = int(np.ceil(t_arrive / (self.config.episode.dt + 1e-9)))
+        return max(1, int(self.config.episode.max_steps) - arrive_steps)
+
+    @staticmethod
+    def _score(numer_steps: int, possible_steps: int) -> float:
+        denom = max(int(possible_steps), 1)
+        score = 100.0 * float(numer_steps) / float(denom)
+        return float(np.clip(score, 0.0, 100.0))
+
+    def reset_episode_metrics(
+        self,
+        env: Any,
+        drone_state: Dict[str, np.ndarray],
+        platform_state: Dict[str, np.ndarray],
+    ) -> None:
+        env._stage1_train_hit_steps = 0
+        env._stage1_eval_hold_steps = 0
+        env._stage1_eval_max_hold_steps = 0
+        env._stage1_train_possible_steps = self._possible_steps(
+            env,
+            drone_state,
+            platform_state,
+            horiz_tol=self.TRAIN_SUCCESS_RADIUS,
+            vert_tol=self.TRAIN_SUCCESS_VERT_TOL,
+        )
+        env._stage1_eval_possible_steps = self._possible_steps(
+            env,
+            drone_state,
+            platform_state,
+            horiz_tol=self.HOLD_RADIUS,
+            vert_tol=self.HOLD_VERT_TOL,
+        )
+
+    def update_step_metrics(
+        self,
+        env: Any,
+        drone_state: Dict[str, np.ndarray],
+        platform_state: Dict[str, np.ndarray],
+        target_pos: np.ndarray,
+    ) -> None:
+        if self._state_in_box(
+            drone_state=drone_state,
+            target_pos=target_pos,
+            horiz_tol=self.TRAIN_SUCCESS_RADIUS,
+            vert_tol=self.TRAIN_SUCCESS_VERT_TOL,
+            speed_max=self.TRAIN_SUCCESS_SPEED_MAX,
+        ):
+            env._stage1_train_hit_steps = int(
+                getattr(env, "_stage1_train_hit_steps", 0)
+            ) + 1
+
+        if self.is_hold_stable(
+            drone_state=drone_state,
+            platform_state=platform_state,
+            target_pos=target_pos,
+        ):
+            env._stage1_eval_hold_steps = int(
+                getattr(env, "_stage1_eval_hold_steps", 0)
+            ) + 1
+        else:
+            env._stage1_eval_hold_steps = 0
+        env._stage1_eval_max_hold_steps = max(
+            int(getattr(env, "_stage1_eval_max_hold_steps", 0)),
+            int(getattr(env, "_stage1_eval_hold_steps", 0)),
+        )
+
+    def _train_score(self, env: Any) -> float:
+        return self._score(
+            int(getattr(env, "_stage1_train_hit_steps", 0)),
+            int(getattr(env, "_stage1_train_possible_steps", 1)),
+        )
+
+    def _eval_score(self, env: Any) -> float:
+        return self._score(
+            int(getattr(env, "_stage1_eval_max_hold_steps", 0)),
+            int(getattr(env, "_stage1_eval_possible_steps", 1)),
+        )
+
+    def get_episode_metrics(self, env: Any) -> dict:
+        return {
+            "stage1_train_score": float(self._train_score(env)),
+            "stage1_train_hit_steps": int(getattr(env, "_stage1_train_hit_steps", 0)),
+            "stage1_train_possible_steps": int(
+                getattr(env, "_stage1_train_possible_steps", 1)
+            ),
+            "stage1_eval_score": float(self._eval_score(env)),
+            "stage1_eval_max_hold_steps": int(
+                getattr(env, "_stage1_eval_max_hold_steps", 0)
+            ),
+            "stage1_eval_possible_steps": int(
+                getattr(env, "_stage1_eval_possible_steps", 1)
+            ),
+        }
 
     def compute_reward(
         self,
@@ -237,6 +381,10 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
     ) -> Tuple[float, bool]:
         if term_info.get("termination") in {"oob", "below_ground"}:
             return self.OOB_PENALTY, False
+        if truncated:
+            mode = env.get_success_mode() if env is not None else "train"
+            score = self._eval_score(env) if mode == "eval" else self._train_score(env)
+            return 0.0, bool(score > self.SUCCESS_SCORE_THRESHOLD)
         return 0.0, False
 
     def reward_log_columns(self) -> Tuple[str, ...]:

@@ -22,7 +22,7 @@ from typing import Dict, List
 from stable_baselines3.common.callbacks import BaseCallback
 
 from curriculum.curriculum_manager import CurriculumManager, STAGE_SHORT_LABELS
-from curriculum.strategies import create_strategy
+from curriculum.strategies import create_strategy, registered_episode_metric_keys
 from configs.env_config import EnvConfig
 
 logger = logging.getLogger(__name__)
@@ -133,10 +133,22 @@ class CurriculumCallback(BaseCallback):
                            self.manager.rolling_avg_length())
         self.logger.record("curriculum/stage_episodes",
                            float(eps))
+        metric_keys = self.manager.current_episode_metric_keys()
+        for key in metric_keys:
+            self.logger.record(
+                f"curriculum/rolling_{key}",
+                self.manager.rolling_metric(key),
+            )
         self.logger.dump(self.num_timesteps)
 
         if self.verbose >= 1:
             sr_window = self.manager.cfg.window_size
+            stage1_score = ""
+            if "stage1_train_score" in metric_keys:
+                stage1_score = (
+                    f" | TrainScore{sr_window}="
+                    f"{self.manager.rolling_metric('stage1_train_score'):.1f}"
+                )
             _write_progress_line(
                 f"[{self.num_timesteps:>10,}] "
                 f"Stage {st} {STAGE_SHORT_LABELS[st]} | "
@@ -144,6 +156,7 @@ class CurriculumCallback(BaseCallback):
                 f"SuccessRate{sr_window}={sr:.1%} | "
                 f"AvgR{sr_window}={self.manager.rolling_avg_reward():+.1f} | "
                 f"AvgLen{sr_window}={self.manager.rolling_avg_length():.0f}"
+                f"{stage1_score}"
             )
 
 
@@ -162,7 +175,7 @@ class CSVLoggingCallback(BaseCallback):
     """
 
     # 列定义（用于 CSV 表头）
-    EPISODE_COLS = [
+    BASE_EPISODE_COLS = [
         "timestep", "stage", "reward", "length", "success",
     ]
     TRAIN_COLS = [
@@ -184,6 +197,10 @@ class CSVLoggingCallback(BaseCallback):
         self._reward_ws: Dict[int, csv.DictWriter] = {}
         self._reward_cols: Dict[int, tuple] = {}
         self._reward_strategies: Dict[int, object] = {}
+        self._episode_cols = [
+            *self.BASE_EPISODE_COLS,
+            *registered_episode_metric_keys(),
+        ]
         self._has_written_header = False
 
     def _on_training_start(self) -> None:
@@ -196,7 +213,7 @@ class CSVLoggingCallback(BaseCallback):
                 w.writeheader()
             return fh, w
 
-        self._episode_fh, self._episode_w = _open("episode_log.csv",  self.EPISODE_COLS)
+        self._episode_fh, self._episode_w = _open("episode_log.csv",  self._episode_cols)
         self._train_fh,   self._train_w   = _open("training_log.csv", self.TRAIN_COLS)
         self._has_written_header = True
 
@@ -246,13 +263,17 @@ class CSVLoggingCallback(BaseCallback):
 
             # 回合行
             if ep is not None and self._episode_w:
-                self._episode_w.writerow({
+                episode_row = {
                     "timestep": ts,
                     "stage":    stage,
                     "reward":   round(ep.get("r", 0.0), 4),
                     "length":   ep.get("l", 0),
                     "success":  int(bool(_episode_value(info, ep, "success", False))),
-                })
+                }
+                for key in self._episode_cols:
+                    if key not in episode_row:
+                        episode_row[key] = _episode_value(info, ep, key, 0.0)
+                self._episode_w.writerow(episode_row)
                 self._episode_fh.flush()
 
             # 奖励分项行（每个包含奖励 info 的 step）

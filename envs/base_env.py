@@ -101,6 +101,7 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         self._stage1_r_hold_total: float = 0.0
         self._stage1_hold_refund_steps: int = 0
         self._stage1_is_refunding_hold: bool = False
+        self._success_mode: str = "train"
 
         # 每个 episode 随机化的控制能力
         dc = self.config.drone
@@ -232,6 +233,16 @@ class BaseDroneLandingEnv(gym.Env, ABC):
     def get_hover_height(self) -> float:
         return float(self.strategy.get_hover_height())
 
+    def set_success_mode(self, mode: str) -> None:
+        """设置策略终局 success 口径：训练或评估。"""
+        mode = str(mode).strip().lower()
+        if mode not in {"train", "eval"}:
+            raise ValueError("success mode must be 'train' or 'eval'")
+        self._success_mode = mode
+
+    def get_success_mode(self) -> str:
+        return str(self._success_mode)
+
     # =========================================================================
     # Gymnasium API：所有后端共享的实现
     # =========================================================================
@@ -257,6 +268,7 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         drone_state = self._get_drone_state()
         platform_state = self._get_platform_state()
         self._reset_hold_tracking()
+        self.strategy.reset_episode_metrics(self, drone_state, platform_state)
         obs = self._build_observation(drone_state, platform_state)
         return obs, {}
 
@@ -298,6 +310,13 @@ class BaseDroneLandingEnv(gym.Env, ABC):
                 self._hover_hold_steps = 0
         else:
             self._hover_hold_steps = 0
+
+        self.strategy.update_step_metrics(
+            self,
+            drone_state,
+            platform_state,
+            self._get_target_pos(platform_state["position"]),
+        )
 
         # 5. 计算稠密奖励
         target_pos = self._get_target_pos(platform_state["position"])

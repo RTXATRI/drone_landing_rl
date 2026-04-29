@@ -266,6 +266,11 @@ class Trainer:
             f"AvgR{sr_window}: {curriculum.rolling_avg_reward():+.1f} | "
             f"AvgLen{sr_window}: {curriculum.rolling_avg_length():.0f}"
         )
+        if "stage1_train_score" in curriculum.current_episode_metric_keys():
+            logger.info(
+                f"TrainScore{sr_window}: "
+                f"{curriculum.rolling_metric('stage1_train_score'):.1f}"
+            )
         logger.info("-" * 60)
 
     def _confirm_next_stage(self, next_stage: int) -> bool:

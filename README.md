@@ -411,10 +411,12 @@ conda run --no-capture-output -n drone_rl python scripts\train.py
 
 训练阶段保持随机化：策略可在 reset 时自行采样场景参数，速度能力也在每个 episode 随机采样。评估入口中的固定控制参数只影响验证，不影响训练。
 
+Stage 1 的训练成功率来自训练口径百分制分数：累计处于水平误差 `<0.20m`、垂直误差 `<0.15m`、实际速度 `<0.15m/s` 的步数，除以按当前 episode 初始距离和速度能力估算的理论可用步数；`stage1_train_score > 60` 记为训练成功，但不增加成功奖励。评估入口会切换为 eval 口径：统计稳定悬停保持空间内的最长连续步数，指标为 `stage1_eval_score` 和 `stage1_eval_max_hold_steps`。
+
 训练时的周期性控制台日志会使用清晰的滚动窗口命名，例如：
 
 ```text
-[   128,000] Stage 1 BuiltinStrategy | Eps=36 | SuccessRate30=0.0% | StrategyMetric100=0.0
+[   128,000] Stage 1 Hover-Static | Eps=36 | SuccessRate30=42.0% | AvgR30=+123.4 | AvgLen30=3600 | TrainScore30=58.5
 ```
 
 其中 `SuccessRate30` 表示最近 30 个 episode 的滚动成功率，窗口大小来自 `CurriculumConfig.window_size`，不是 30 个训练 step。
@@ -555,6 +557,8 @@ http://localhost:6006
 | `train/ent_coef` | SAC 熵系数 |
 | `curriculum/stage` | 当前课程阶段 |
 | `curriculum/rolling_success_rate` | 滚动成功率 |
+| `curriculum/rolling_stage1_train_score` | Stage 1 训练口径滚动百分制分数 |
+| `curriculum/rolling_stage1_eval_score` | Stage 1 评估口径滚动百分制分数 |
 
 环境 `info` 中还会提供轻量扰动调试指标，便于训练时确认实际速度来源：
 
@@ -573,7 +577,7 @@ CSV 输出：
 
 ```text
 data/csv/{exp_name}/
-├── episode_log.csv     每回合：timestep, stage, reward, length, success
+├── episode_log.csv     每回合：timestep, stage, reward, length, success，以及策略声明的 episode 指标
 ├── reward_log_stageN.csv 每步核心奖励分项和距离/速度指标
 └── training_log.csv    定期记录 actor_loss, critic_loss, ent_coef, lr, fps
 ```
@@ -839,6 +843,7 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model mod
 | `--render_speed` | `1.0` | GUI 播放速度；`0` 表示不 sleep、尽可能快渲染 |
 | `--device` | `cpu` | 模型推理设备，评估默认 `cpu` |
 | `--seed` | `0` | 评估随机种子 |
+| `--random_seed` | 开关 | 每次评估启动时生成新的随机 base seed；会打印实际 seed，便于复现 |
 | `--traj_enable` | 开关 | 开启详细轨迹采集 |
 | `--traj_plot` | 开关 | 评估后生成离线轨迹图 |
 | `--traj_plot_realtime` | 开关 | 评估时显示实时轨迹图 |

@@ -39,6 +39,14 @@ from training.trainer import EPISODE_INFO_KEYWORDS
 PASS = "  [PASS]"
 FAIL = "  [FAIL]"
 OBS_DIM = 34
+STAGE1_EPISODE_METRIC_KEYS = (
+    "stage1_train_score",
+    "stage1_train_hit_steps",
+    "stage1_train_possible_steps",
+    "stage1_eval_score",
+    "stage1_eval_max_hold_steps",
+    "stage1_eval_possible_steps",
+)
 
 
 def _make_env(cfg: EnvConfig, stage: int = 1, render_mode=None) -> DroneLandingEnv:
@@ -358,56 +366,125 @@ def test_spawn_range_and_oob_margin(env: DroneLandingEnv) -> bool:
     return ok
 
 
-def _place_drone_at_hover_target(env: DroneLandingEnv) -> None:
-    """将运动学无人机精确放到当前悬停目标点。"""
-    platform_state = env._get_platform_state()
-    target = env._get_target_pos(platform_state["position"])
-    env._drone_model.position = target.copy()
-    env._drone_model.velocity = np.zeros(3)
-    env._drone_model._filt_vel = np.zeros(3)
-    env._drone_state = env._drone_model.get_state()
+def _reset_strategy_episode_metrics(env: DroneLandingEnv) -> None:
+    env.strategy.reset_episode_metrics(
+        env,
+        env._get_drone_state(),
+        env._get_platform_state(),
+    )
 
 
-def _place_drone_away_from_hover_target(env: DroneLandingEnv, offset=(1.0, 0.0, 0.0)) -> None:
-    """将无人机放到悬停稳定范围之外。"""
+def _place_drone_at_hover_target(env: DroneLandingEnv, offset=(0.0, 0.0, 0.0)) -> None:
+    """将运动学无人机放到当前悬停目标点附近，并重算策略 episode 指标。"""
     platform_state = env._get_platform_state()
     target = env._get_target_pos(platform_state["position"])
     env._drone_model.position = target + np.array(offset, dtype=np.float32)
     env._drone_model.velocity = np.zeros(3)
     env._drone_model._filt_vel = np.zeros(3)
     env._drone_state = env._drone_model.get_state()
+    _reset_strategy_episode_metrics(env)
+
+
+def _place_drone_away_from_hover_target(env: DroneLandingEnv, offset=(1.0, 0.0, 0.0)) -> None:
+    """将无人机放到悬停稳定范围之外，并重算策略 episode 指标。"""
+    _place_drone_at_hover_target(env, offset=offset)
+
+
+def _run_zero_action_episode(env: DroneLandingEnv) -> tuple:
+    info = {}
+    reward = 0.0
+    term = trunc = False
+    for _ in range(int(env.config.episode.max_steps)):
+        _, reward, term, trunc, info = env.step(np.zeros(4, np.float32))
+        if term or trunc:
+            break
+    return reward, term, trunc, info
 
 
 def test_stage1_terminal_behavior() -> bool:
     _header("Test 12: Stage-1 Terminal Behavior")
     ok = True
 
-    low_cfg = EnvConfig()
-    low_cfg.disturbance.enabled = False
-    low_cfg.episode.max_steps = 3
-    low_env = _make_env(low_cfg, stage=1)
-    low_env.reset(seed=48)
-    _place_drone_at_hover_target(low_env)
-    low_info = {}
-    for _ in range(3):
-        _, _, _, _, low_info = low_env.step(np.zeros(4, np.float32))
-    low_ep = low_info.get("episode", {})
-    ok &= _check(not bool(low_ep.get("success", False)),
-                 "max_steps truncation does not mark Stage 1 success")
-    ok &= _check("hover_score" not in low_ep,
-                 "Stage 1 episode info no longer exports hover_score")
-    low_env.close()
+    train_cfg = EnvConfig()
+    train_cfg.disturbance.enabled = False
+    train_cfg.episode.max_steps = 3
+    train_env = _make_env(train_cfg, stage=1)
+    train_env.reset(seed=48)
+    _place_drone_at_hover_target(train_env, offset=(0.15, 0.0, 0.0))
+    _, _, _, train_info = _run_zero_action_episode(train_env)
+    train_ep = train_info.get("episode", {})
+    ok &= _check(bool(train_ep.get("success", False)),
+                 "train mode: wide Stage 1 success space marks success")
+    ok &= _check(float(train_ep.get("stage1_train_score", 0.0)) > 60.0,
+                 f"train mode: train score > 60  [got {train_ep.get('stage1_train_score', 0.0):.1f}]")
+    ok &= _check(float(train_ep.get("stage1_eval_score", 100.0)) <= 60.0,
+                 f"train mode: eval score remains <= 60  [got {train_ep.get('stage1_eval_score', 0.0):.1f}]")
+    ok &= _check("hover_score" not in train_ep,
+                 "Stage 1 episode info still does not export old hover_score")
+    train_env.close()
+
+    eval_fail_cfg = EnvConfig()
+    eval_fail_cfg.disturbance.enabled = False
+    eval_fail_cfg.episode.max_steps = 3
+    eval_fail_env = _make_env(eval_fail_cfg, stage=1)
+    eval_fail_env.set_success_mode("eval")
+    eval_fail_env.reset(seed=48)
+    _place_drone_at_hover_target(eval_fail_env, offset=(0.15, 0.0, 0.0))
+    _, _, _, eval_fail_info = _run_zero_action_episode(eval_fail_env)
+    eval_fail_ep = eval_fail_info.get("episode", {})
+    ok &= _check(not bool(eval_fail_ep.get("success", False)),
+                 "eval mode: same wide-only state is not a success")
+    ok &= _check(float(eval_fail_ep.get("stage1_eval_score", 100.0)) <= 60.0,
+                 f"eval mode: eval score <= 60  [got {eval_fail_ep.get('stage1_eval_score', 0.0):.1f}]")
+    eval_fail_env.close()
+
+    eval_success_cfg = EnvConfig()
+    eval_success_cfg.disturbance.enabled = False
+    eval_success_cfg.episode.max_steps = 3
+    eval_success_env = _make_env(eval_success_cfg, stage=1)
+    eval_success_env.set_success_mode("eval")
+    eval_success_env.reset(seed=49)
+    _place_drone_at_hover_target(eval_success_env)
+    _, _, _, eval_success_info = _run_zero_action_episode(eval_success_env)
+    eval_success_ep = eval_success_info.get("episode", {})
+    ok &= _check(bool(eval_success_ep.get("success", False)),
+                 "eval mode: stable hold space marks success")
+    ok &= _check(float(eval_success_ep.get("stage1_eval_score", 0.0)) > 60.0,
+                 f"eval mode: eval score > 60  [got {eval_success_ep.get('stage1_eval_score', 0.0):.1f}]")
+    eval_success_env.close()
 
     oob_cfg = EnvConfig()
+    oob_cfg.disturbance.enabled = False
+    oob_cfg.episode.max_steps = 3
     oob_env = _make_env(oob_cfg, stage=1)
     oob_env.reset(seed=49)
+    _place_drone_at_hover_target(oob_env)
     oob_env._drone_model.position = np.array([999.0, 0.0, 3.0])
     oob_env._drone_state = oob_env._drone_model.get_state()
     _, reward, term, _, oob_info = oob_env.step(np.zeros(4, np.float32))
     ok &= _check(term and oob_info.get("termination") == "oob",
                  "Stage 1 OOB terminates episode")
     ok &= _check(reward < -50.0, f"Stage 1 OOB keeps terminal penalty  [got {reward:.2f}]")
+    ok &= _check(not bool(oob_info.get("episode", {}).get("success", False)),
+                 "Stage 1 OOB overrides success metrics and marks failure")
     oob_env.close()
+
+    low_cfg = EnvConfig()
+    low_cfg.disturbance.enabled = False
+    low_cfg.episode.max_steps = 3
+    low_env = _make_env(low_cfg, stage=1)
+    low_env.reset(seed=50)
+    _place_drone_at_hover_target(low_env)
+    low_env._drone_model.position = np.array([0.0, 0.0, -2.0])
+    low_env._drone_state = low_env._drone_model.get_state()
+    _, reward, term, _, low_info = low_env.step(np.zeros(4, np.float32))
+    ok &= _check(term and low_info.get("termination") == "below_ground",
+                 "Stage 1 below-ground terminates episode")
+    ok &= _check(reward < -50.0,
+                 f"Stage 1 below-ground keeps terminal penalty  [got {reward:.2f}]")
+    ok &= _check(not bool(low_info.get("episode", {}).get("success", False)),
+                 "Stage 1 below-ground overrides success metrics and marks failure")
+    low_env.close()
     return ok
 
 
@@ -437,10 +514,14 @@ def test_vecmonitor_preserves_episode_core_fields() -> bool:
     ok &= _check(bool(done[0]), "VecMonitor receives terminal episode")
     ok &= _check(all(key in ep for key in ("r", "l", "t")),
                  "VecMonitor keeps SB3 native r/l/t episode fields")
-    ok &= _check(not bool(ep.get("success", False)),
+    ok &= _check(bool(ep.get("success", False)),
                  "VecMonitor preserves custom success field")
     ok &= _check(ep.get("episode_stage", 0) == 1,
                  "VecMonitor preserves custom episode_stage field")
+    ok &= _check(all(key in ep for key in STAGE1_EPISODE_METRIC_KEYS),
+                 "VecMonitor preserves Stage 1 episode metric keys")
+    ok &= _check(float(ep.get("stage1_train_score", 0.0)) > 60.0,
+                 "VecMonitor preserves Stage 1 train score")
     ok &= _check("hover_score" not in ep, "VecMonitor episode has no hover_score")
     return ok
 

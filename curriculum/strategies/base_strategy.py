@@ -78,6 +78,23 @@ class CurriculumStrategy(ABC):
         """返回当前 step 是否处于该策略定义的稳定保持区间。"""
         return False
 
+    def reset_episode_metrics(
+        self,
+        env: Any,
+        drone_state: Dict[str, np.ndarray],
+        platform_state: Dict[str, np.ndarray],
+    ) -> None:
+        """在 reset 后初始化策略私有 episode 指标。"""
+
+    def update_step_metrics(
+        self,
+        env: Any,
+        drone_state: Dict[str, np.ndarray],
+        platform_state: Dict[str, np.ndarray],
+        target_pos: np.ndarray,
+    ) -> None:
+        """每步更新策略私有 episode 指标。"""
+
     def terminal_bonus(
         self,
         *,
