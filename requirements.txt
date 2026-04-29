@@ -1,0 +1,44 @@
+# 功能：声明无人机降落强化学习工程的 Python 依赖。
+# 当前 conda drone_rl 环境验证版本为 Python 3.13.13。
+# 版本范围按 drone_rl 环境中已验证的包收紧，避免 pip 自动升级到未验证的大版本。
+
+# Core RL stack
+gymnasium>=1.2.3,<1.3
+stable-baselines3>=2.8.0,<2.9
+# GPU 训练请先按本机 CUDA 版本手动安装 PyTorch GPU wheel。
+# 当前 drone_rl 环境验证版本为 torch==2.7.1+cu128，例如：
+#   pip install torch==2.7.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+# 然后再安装本文件其余依赖。下面的约束用于校验/兼容已安装的 torch，
+# 若未预装 torch，普通 PyPI 可能会解析到 CPU 版 wheel。
+torch>=2.7.1,<2.8
+
+# Simulation
+pybullet==3.2.7
+
+# Scientific computing
+numpy>=2.4.3,<2.5
+scipy>=1.17.1,<1.18
+
+# Logging & progress
+# TensorBoard 2.20 still imports pkg_resources; setuptools 82+ no longer
+# provides that compatibility module in this environment.
+setuptools>=80,<81
+tensorboard>=2.20.0,<2.21
+tqdm>=4.67.3,<4.68
+rich>=15.0.0,<15.1
+
+# Plotting & data analysis
+matplotlib>=3.10.9,<3.11
+pandas>=3.0.2,<3.1
+
+# Evaluation video export
+opencv-python==4.13.0.92
+# scripts/record_video.py can also use imageio when installed, but the
+# verified drone_rl environment currently uses the OpenCV fallback.
+# imageio>=2.37.2,<2.38
+# imageio-ffmpeg==0.6.0
+
+# Optional: ONNX export / verification.
+# 当前 drone_rl 环境未安装；需要运行 scripts/export_model.py --format onnx 或 --verify 时再安装。
+# onnx>=1.16,<1.22
+# onnxruntime>=1.19,<1.26
