@@ -261,16 +261,19 @@ class Trainer:
             f"Steps: {curriculum.stage_steps():,}/{planned_steps:,} | "
             f"Episodes: {stats.episodes:,}"
         )
-        logger.info(
-            f"SuccessRate{sr_window}: {curriculum.rolling_success_rate():.1%} | "
-            f"AvgR{sr_window}: {curriculum.rolling_avg_reward():+.1f} | "
-            f"AvgLen{sr_window}: {curriculum.rolling_avg_length():.0f}"
-        )
+        summary_fields = [
+            f"SuccessRate{sr_window}: {curriculum.rolling_success_rate():.1%}",
+        ]
         if "stage1_train_score" in curriculum.current_episode_metric_keys():
-            logger.info(
-                f"TrainScore{sr_window}: "
+            summary_fields.append(
+                f"AvgTrainScore{sr_window}: "
                 f"{curriculum.rolling_metric('stage1_train_score'):.1f}"
             )
+        summary_fields.extend([
+            f"AvgLen{sr_window}: {curriculum.rolling_avg_length():.0f}",
+            f"AvgReward{sr_window}: {curriculum.rolling_avg_reward():+.1f}",
+        ])
+        logger.info(" | ".join(summary_fields))
         logger.info("-" * 60)
 
     def _confirm_next_stage(self, next_stage: int) -> bool:

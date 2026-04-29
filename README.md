@@ -416,7 +416,7 @@ Stage 1 的训练成功率来自训练口径百分制分数：累计处于水平
 训练时的周期性控制台日志会使用清晰的滚动窗口命名，例如：
 
 ```text
-[   128,000] Stage 1 Hover-Static | Eps=36 | SuccessRate30=42.0% | AvgR30=+123.4 | AvgLen30=3600 | TrainScore30=58.5
+[   128,000] Stage 1 Hover-Static | Eps=36 | SuccessRate30=42.0% | AvgTrainScore30=58.5 | AvgLen30=3600 | AvgReward30=+123.4
 ```
 
 其中 `SuccessRate30` 表示最近 30 个 episode 的滚动成功率，窗口大小来自 `CurriculumConfig.window_size`，不是 30 个训练 step。

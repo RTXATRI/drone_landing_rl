@@ -90,7 +90,7 @@ class CurriculumCallback(BaseCallback):
       - 每 `check_freq` 步：将阶段指标写入 TensorBoard/控制台
     """
 
-    def __init__(self, manager: CurriculumManager, check_freq: int = 8_000,
+    def __init__(self, manager: CurriculumManager, check_freq: int = 1_000,
                  verbose: int = 1):
         super().__init__(verbose)
         self.manager = manager
@@ -143,20 +143,21 @@ class CurriculumCallback(BaseCallback):
 
         if self.verbose >= 1:
             sr_window = self.manager.cfg.window_size
-            stage1_score = ""
+            summary_fields = [f"SuccessRate{sr_window}={sr:.1%}"]
             if "stage1_train_score" in metric_keys:
-                stage1_score = (
-                    f" | TrainScore{sr_window}="
+                summary_fields.append(
+                    f"AvgTrainScore{sr_window}="
                     f"{self.manager.rolling_metric('stage1_train_score'):.1f}"
                 )
+            summary_fields.extend([
+                f"AvgLen{sr_window}={self.manager.rolling_avg_length():.0f}",
+                f"AvgReward{sr_window}={self.manager.rolling_avg_reward():+.1f}",
+            ])
             _write_progress_line(
                 f"[{self.num_timesteps:>10,}] "
                 f"Stage {st} {STAGE_SHORT_LABELS[st]} | "
                 f"Eps={eps} | "
-                f"SuccessRate{sr_window}={sr:.1%} | "
-                f"AvgR{sr_window}={self.manager.rolling_avg_reward():+.1f} | "
-                f"AvgLen{sr_window}={self.manager.rolling_avg_length():.0f}"
-                f"{stage1_score}"
+                + " | ".join(summary_fields)
             )
 
 
