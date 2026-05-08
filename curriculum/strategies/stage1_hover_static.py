@@ -12,62 +12,24 @@ from curriculum.strategies.base_strategy import CurriculumStrategy, HoverStrateg
 class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
     label = "Hover  | Static Platform"
     short_label = "Hover-Static"
-    episode_metrics = (
-        "stage1_train_score",
-        "stage1_train_hit_steps",
-        "stage1_train_possible_steps",
-        "stage1_eval_score",
-        "stage1_eval_max_hold_steps",
-        "stage1_eval_possible_steps",
-    )
+    episode_metrics = ("train_score", "eval_score")
 
-    # 位置奖励：水平和高度分离的高斯接近奖励。
-    POS_XY_WEIGHT = 3.0
-    POS_XY_SIGMA = 0.25
-    POS_Z_WEIGHT = 3.5
-    POS_Z_SIGMA = 0.20
-
-    # 速度惩罚：只在目标附近逐渐打开，避免远距离接近阶段被压制。
-    VEL_WEIGHT = 0.20
-    VEL_GATE_XY_INNER = 0.25
-    VEL_GATE_XY_OUTER = 0.75
-    VEL_GATE_Z_INNER = 0.20
-    VEL_GATE_Z_OUTER = 0.60
-
-    # 姿态和动作平滑。
-    YAW_WEIGHT = 0.20
-    YAW_RATE_WEIGHT = 0.05
-    ACTION_SMOOTH_WEIGHT = 0.10
-    ACTION_MAG_WEIGHT = 0.01
-
-    # 实际速度朝向目标的 shaping。
-    VELOCITY_TOWARD_WEIGHT = 1.0
-    VELOCITY_TOWARD_DISTANCE_SCALE = 5.0
-    VELOCITY_TOWARD_MIN_SPEED = 0.03
-    VELOCITY_TOWARD_FULL_SPEED = 0.10
-    VELOCITY_TOWARD_MIN_DIST = 0.05
-
-    # 稳定悬停保持奖励和保持区间。
-    HOLD_BASE_REWARD = 0.05
-    HOLD_CAP_STEPS = 500
-    HOLD_RADIUS = 0.10
-    HOLD_VERT_TOL = 0.08
-    HOLD_SPEED_MAX = 0.10
-
-    # Stage 1 成功判定：训练使用较宽空间的总命中步数，评估使用稳定保持空间的最长连续步数。
-    TRAIN_SUCCESS_RADIUS = 0.20
-    TRAIN_SUCCESS_VERT_TOL = 0.15
-    TRAIN_SUCCESS_SPEED_MAX = 0.15
-    SUCCESS_SCORE_THRESHOLD = 60.0
-
-    # 终止塑形。成功只作为指标，不给额外成功奖励。
-    OOB_PENALTY = -100.0
+    # ── 多方法共享参数 ──────────────────────────────────────────────────────
+    HOLD_RADIUS = 0.10              # 保持判定水平半径 (m)
+    HOLD_VERT_TOL = 0.08            # 保持判定垂直容差 (m)
+    HOLD_SPEED_MAX = 0.10           # 保持判定最大速度 (m/s)
+    TRAIN_SUCCESS_RADIUS = 0.20     # 训练成功水平半径 (m)
+    TRAIN_SUCCESS_VERT_TOL = 0.15   # 训练成功垂直容差 (m)
+    TRAIN_SUCCESS_SPEED_MAX = 0.15  # 训练成功最大速度 (m/s)
+    SUCCESS_SCORE_THRESHOLD = 60.0  # 成功分数阈值 (0-100)
+    OOB_PENALTY = -100.0            # 越界终止惩罚
 
     def stage_id(self) -> int:
         return 1
 
     def setup_scene(self, env, rng: np.random.Generator) -> None:
-        self._setup_hover_scene(env, rng, motion="static")
+        from envs.landing_platform.motions.static_motion import StaticMotion
+        self._setup_hover_scene(env, rng, motion_strategy=StaticMotion())
 
     @staticmethod
     def _smoothstep(x: float) -> float:
@@ -207,18 +169,8 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
 
     def get_episode_metrics(self, env: Any) -> dict:
         return {
-            "stage1_train_score": float(self._train_score(env)),
-            "stage1_train_hit_steps": int(getattr(env, "_stage1_train_hit_steps", 0)),
-            "stage1_train_possible_steps": int(
-                getattr(env, "_stage1_train_possible_steps", 1)
-            ),
-            "stage1_eval_score": float(self._eval_score(env)),
-            "stage1_eval_max_hold_steps": int(
-                getattr(env, "_stage1_eval_max_hold_steps", 0)
-            ),
-            "stage1_eval_possible_steps": int(
-                getattr(env, "_stage1_eval_possible_steps", 1)
-            ),
+            "train_score": float(self._train_score(env)),
+            "eval_score": float(self._eval_score(env)),
         }
 
     def compute_reward(
@@ -242,66 +194,94 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         dist = float(np.linalg.norm(target_vec))
         speed = float(np.linalg.norm(drone_vel))
 
+        # ── 位置奖励：高斯接近奖励 ──
+        # σ 越小奖励越集中，驱动更精确的定位
+        POS_XY_WEIGHT = 3.0    # XY 位置奖励权重
+        POS_XY_SIGMA = 0.25    # XY 高斯 σ (m)，0.25m 处降至 ~14%
+        POS_Z_WEIGHT = 3.5     # Z  位置奖励权重
+        POS_Z_SIGMA = 0.20     # Z  高斯 σ (m)
         r_pos = (
-            self.POS_XY_WEIGHT
-            * float(np.exp(-(horiz_err ** 2) / (2.0 * self.POS_XY_SIGMA ** 2)))
-            + self.POS_Z_WEIGHT
-            * float(np.exp(-(vert_err ** 2) / (2.0 * self.POS_Z_SIGMA ** 2)))
+            POS_XY_WEIGHT
+            * float(np.exp(-(horiz_err ** 2) / (2.0 * POS_XY_SIGMA ** 2)))
+            + POS_Z_WEIGHT
+            * float(np.exp(-(vert_err ** 2) / (2.0 * POS_Z_SIGMA ** 2)))
         )
 
+        # ── 速度惩罚：vel_gate 控制强度，远距=0 近距=1 ──
+        VEL_WEIGHT = 0.20
+        VEL_GATE_XY_INNER = 0.25   # 全惩罚内阈值 (m)
+        VEL_GATE_XY_OUTER = 0.75   # 零惩罚外阈值 (m)
+        VEL_GATE_Z_INNER = 0.20
+        VEL_GATE_Z_OUTER = 0.60
         g_xy = self._smoothstep(
-            (self.VEL_GATE_XY_OUTER - horiz_err)
-            / (self.VEL_GATE_XY_OUTER - self.VEL_GATE_XY_INNER)
+            (VEL_GATE_XY_OUTER - horiz_err)
+            / (VEL_GATE_XY_OUTER - VEL_GATE_XY_INNER)
         )
         g_z = self._smoothstep(
-            (self.VEL_GATE_Z_OUTER - vert_err)
-            / (self.VEL_GATE_Z_OUTER - self.VEL_GATE_Z_INNER)
+            (VEL_GATE_Z_OUTER - vert_err)
+            / (VEL_GATE_Z_OUTER - VEL_GATE_Z_INNER)
         )
         vel_gate = float(g_xy * g_z)
-        r_vel = -self.VEL_WEIGHT * vel_gate * float(np.dot(drone_vel, drone_vel))
+        r_vel = -VEL_WEIGHT * vel_gate * float(np.dot(drone_vel, drone_vel))
 
+        # ── 偏航角惩罚 ──
+        YAW_WEIGHT = 0.20
         yaw = float(drone_state["euler"][2])
-        r_yaw = -self.YAW_WEIGHT * abs(yaw)
+        r_yaw = -YAW_WEIGHT * abs(yaw)
 
+        # ── 接近奖励：速度方向对准目标方向 ──
+        VELOCITY_TOWARD_WEIGHT = 1.0           # 权重
+        VELOCITY_TOWARD_DISTANCE_SCALE = 5.0   # 距离衰减半衰点 (m)
+        VELOCITY_TOWARD_MIN_SPEED = 0.03       # 最低有效速度 (m/s)
+        VELOCITY_TOWARD_FULL_SPEED = 0.10      # 全权重速度 (m/s)
+        VELOCITY_TOWARD_MIN_DIST = 0.05        # 最低有效距离 (m)
         r_velocity_toward = 0.0
         velocity_toward_cos = 0.0
         velocity_toward_weight = 0.0
-        if dist >= self.VELOCITY_TOWARD_MIN_DIST and speed >= self.VELOCITY_TOWARD_MIN_SPEED:
+        if dist >= VELOCITY_TOWARD_MIN_DIST and speed >= VELOCITY_TOWARD_MIN_SPEED:
             velocity_toward_cos = float(np.clip(
                 np.dot(drone_vel, target_vec) / (speed * dist + 1e-9),
                 -1.0,
                 1.0,
             ))
             distance_weight = 1.0 / (
-                1.0 + (dist / self.VELOCITY_TOWARD_DISTANCE_SCALE) ** 2
+                1.0 + (dist / VELOCITY_TOWARD_DISTANCE_SCALE) ** 2
             )
             speed_den = max(
-                self.VELOCITY_TOWARD_FULL_SPEED - self.VELOCITY_TOWARD_MIN_SPEED,
+                VELOCITY_TOWARD_FULL_SPEED - VELOCITY_TOWARD_MIN_SPEED,
                 1e-6,
             )
             speed_weight = self._smoothstep(
-                (speed - self.VELOCITY_TOWARD_MIN_SPEED) / speed_den
+                (speed - VELOCITY_TOWARD_MIN_SPEED) / speed_den
             )
             velocity_toward_weight = float(distance_weight * speed_weight)
             r_velocity_toward = (
-                self.VELOCITY_TOWARD_WEIGHT
+                VELOCITY_TOWARD_WEIGHT
                 * velocity_toward_weight
                 * velocity_toward_cos
             )
 
+        # ── 偏航角速度惩罚 ──
+        YAW_RATE_WEIGHT = 0.05
         yaw_inner = 0.10
         yaw_outer = 0.50
         yaw_gate = self._smoothstep((yaw_outer - abs(yaw)) / (yaw_outer - yaw_inner))
         yaw_rate_gate = float(vel_gate * yaw_gate)
         yaw_rate = float(drone_state["yaw_rate"])
-        r_yaw_rate = -self.YAW_RATE_WEIGHT * yaw_rate_gate * yaw_rate ** 2
+        r_yaw_rate = -YAW_RATE_WEIGHT * yaw_rate_gate * yaw_rate ** 2
 
+        # ── 动作平滑和幅值惩罚 ──
+        ACTION_SMOOTH_WEIGHT = 0.10   # 动作变化惩罚权重
+        ACTION_MAG_WEIGHT = 0.01      # 动作幅值惩罚权重
         action_delta = action - prev_action
         r_action = (
-            -self.ACTION_SMOOTH_WEIGHT * float(np.sum(action_delta ** 2))
-            -self.ACTION_MAG_WEIGHT * float(np.sum(action ** 2))
+            -ACTION_SMOOTH_WEIGHT * float(np.sum(action_delta ** 2))
+            -ACTION_MAG_WEIGHT * float(np.sum(action ** 2))
         )
 
+        # ── 保持奖励 + 退款机制 ──
+        HOLD_BASE_REWARD = 0.05   # 每步保持奖励基数
+        HOLD_CAP_STEPS = 500      # 累积奖励上限步数
         r_hold = 0.0
         r_hold_break = 0.0
         if env is not None:
@@ -316,7 +296,7 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             )
 
         if hold_steps > 0:
-            r_hold = self.HOLD_BASE_REWARD * min(int(hold_steps), self.HOLD_CAP_STEPS)
+            r_hold = HOLD_BASE_REWARD * min(int(hold_steps), HOLD_CAP_STEPS)
             if env is not None:
                 env._stage1_r_hold_total += float(r_hold)
                 env._stage1_hold_refund_steps = 0
@@ -325,14 +305,14 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             if prev_hold_steps > 0:
                 env._stage1_is_refunding_hold = True
                 env._stage1_hold_refund_steps = 0
-                if prev_hold_steps >= self.HOLD_CAP_STEPS:
+                if prev_hold_steps >= HOLD_CAP_STEPS:
                     r_hold_break -= 10.0
 
             if env._stage1_is_refunding_hold and env._stage1_r_hold_total > 0.0:
                 env._stage1_hold_refund_steps += 1
-                refund_rate = self.HOLD_BASE_REWARD * min(
+                refund_rate = HOLD_BASE_REWARD * min(
                     int(env._stage1_hold_refund_steps),
-                    self.HOLD_CAP_STEPS,
+                    HOLD_CAP_STEPS,
                 )
                 refund = min(float(env._stage1_r_hold_total), float(refund_rate))
                 r_hold_break -= refund

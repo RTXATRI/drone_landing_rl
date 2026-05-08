@@ -22,7 +22,7 @@ from typing import Dict, List
 from stable_baselines3.common.callbacks import BaseCallback
 
 from curriculum.curriculum_manager import CurriculumManager, STAGE_SHORT_LABELS
-from curriculum.strategies import create_strategy, registered_episode_metric_keys
+from curriculum.strategies import create_strategy
 from configs.env_config import EnvConfig
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,8 @@ class CurriculumCallback(BaseCallback):
         super().__init__(verbose)
         self.manager = manager
         self.check_freq = check_freq
+        self._mixed_count = 0
+        self._total_count = 0
 
     def _on_step(self) -> bool:
         step_delta = int(getattr(self.training_env, "num_envs", 1))
@@ -104,6 +106,12 @@ class CurriculumCallback(BaseCallback):
         for info in self.locals.get("infos", []):
             ep = info.get("episode")
             if ep is not None:
+                ep_stage = _episode_stage(info, ep)
+                self._total_count += 1
+                # 穿插训练的混合回合不记入滚动窗口（修复 Bug 4）
+                if ep_stage != self.manager.current_stage:
+                    self._mixed_count += 1
+                    continue
                 metrics = {
                     key: float(_episode_value(info, ep, key, 0.0))
                     for key in self.manager.current_episode_metric_keys()
@@ -139,15 +147,22 @@ class CurriculumCallback(BaseCallback):
                 f"curriculum/rolling_{key}",
                 self.manager.rolling_metric(key),
             )
+        if self._total_count > 0:
+            self.logger.record(
+                "curriculum/actual_mix_ratio",
+                float(self._mixed_count / self._total_count),
+            )
+        self._mixed_count = 0
+        self._total_count = 0
         self.logger.dump(self.num_timesteps)
 
         if self.verbose >= 1:
             sr_window = self.manager.cfg.window_size
             summary_fields = [f"SuccessRate{sr_window}={sr:.1%}"]
-            if "stage1_train_score" in metric_keys:
+            if "train_score" in metric_keys:
                 summary_fields.append(
                     f"AvgTrainScore{sr_window}="
-                    f"{self.manager.rolling_metric('stage1_train_score'):.1f}"
+                    f"{self.manager.rolling_metric('train_score'):.1f}"
                 )
             summary_fields.extend([
                 f"AvgLen{sr_window}={self.manager.rolling_avg_length():.0f}",
@@ -198,10 +213,7 @@ class CSVLoggingCallback(BaseCallback):
         self._reward_ws: Dict[int, csv.DictWriter] = {}
         self._reward_cols: Dict[int, tuple] = {}
         self._reward_strategies: Dict[int, object] = {}
-        self._episode_cols = [
-            *self.BASE_EPISODE_COLS,
-            *registered_episode_metric_keys(),
-        ]
+        self._episode_cols = [*self.BASE_EPISODE_COLS, "train_score"]
         self._has_written_header = False
 
     def _on_training_start(self) -> None:

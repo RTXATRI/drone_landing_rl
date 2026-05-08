@@ -1,107 +1,105 @@
-# 功能：定义降落平台的静止、直线、正弦和 8 字形运动模式。
+# 功能：带可配置运动模式的降落平台。
 """
 带可配置运动模式的降落平台。
 
-运动类型由当前活动课程策略从外部选择。
-
-支持的运动模式：
-  'static'     — 平台静止
-  'linear'     — 仅沿 X 方向正弦运动
-  'sinusoidal' — X/Y 独立正弦运动（每个 episode 随机相位）
-  'figure8'    — XY 平面内的 8 字形轨迹
+运动逻辑已抽取到 motions/ 策略包中，通过组合模式注入。
+速度控制和边界裁剪通过可选方法按需激活（仅课程二使用）。
 """
 
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict
+
+from configs.env_config import PlatformConfig
+from .motions.base import MotionStrategy
+from .motions.static_motion import StaticMotion
+from .speed_controller import SpeedController
 
 
 class MovingPlatform:
-    SUPPORTED_MOTIONS = {"static", "linear", "sinusoidal", "figure8"}
+    """降落平台。
 
-    def __init__(self, cfg, dt: float):
-        """
-        参数：
-            cfg: PlatformConfig
-            dt:  控制 timestep (s)
-        """
+    运动模式由外部通过 set_motion_strategy() 注入 MotionStrategy 实例。
+    速度控制器和边界裁剪默认关闭，各课程按需激活。
+    """
+
+    def __init__(self, cfg: PlatformConfig, dt: float):
         self.cfg = cfg
-        self.dt  = dt
+        self.dt = dt
 
-        self._origin  = np.zeros(3, dtype=np.float64)
+        self._origin = np.zeros(3, dtype=np.float64)
         self.position = self._origin.copy()
         self.velocity = np.zeros(3, dtype=np.float64)
         self.euler = np.zeros(3, dtype=np.float64)
         self.angular_rate = np.zeros(3, dtype=np.float64)
         self.detection_quality = 1.0
-        self._t       = 0.0
-        self._motion  = "static"
-        self._phi_x   = 0.0
-        self._phi_y   = 0.0
+        self._t = 0.0
+        self._motion_strategy: MotionStrategy = StaticMotion()
+        self._speed_ctrl: SpeedController | None = None
+        self._boundary_xy: float | None = None
 
-    def set_motion(self, motion_type: str) -> None:
-        """选择下一次 reset/episode 使用的平台运动模式。"""
-        motion_type = str(motion_type)
-        if motion_type not in self.SUPPORTED_MOTIONS:
-            known = ", ".join(sorted(self.SUPPORTED_MOTIONS))
-            raise ValueError(f"Unknown platform motion '{motion_type}'. Known: {known}")
-        self._motion = motion_type
+    # ── 组合式配置 ────────────────────────────────────────────────────────────
+
+    def set_motion_strategy(self, strategy: MotionStrategy) -> None:
+        """设置运动策略。各课程在 setup_scene() 中调用。"""
+        if not isinstance(strategy, MotionStrategy):
+            raise TypeError(
+                f"Expected MotionStrategy instance, got {type(strategy).__name__}"
+            )
+        self._motion_strategy = strategy
+
+    def enable_speed_controller(self) -> None:
+        """激活速度控制器。仅课程二调用。"""
+        if self._speed_ctrl is None:
+            self._speed_ctrl = SpeedController()
+
+    def set_boundary(self, xy_limit: float) -> None:
+        """设置平台 XY 位置裁剪边界（半边长）。仅课程二调用。"""
+        self._boundary_xy = float(xy_limit)
+
+    # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     def reset(self, rng: np.random.Generator) -> None:
-        """为新的 episode 重置平台。"""
-        self._t       = 0.0
+        self._t = 0.0
         self.position = self._origin.copy()
         self.velocity = np.zeros(3, dtype=np.float64)
         self.euler = np.zeros(3, dtype=np.float64)
         self.angular_rate = np.zeros(3, dtype=np.float64)
         self.detection_quality = 1.0
+        self._motion_strategy.reset(rng, self.cfg)
+        if self._speed_ctrl is not None:
+            self._speed_ctrl.reset(rng)
+        pos_xy, vel_xy = self._motion_strategy.current_state(self.cfg)
+        self.position[0] = float(pos_xy[0])
+        self.position[1] = float(pos_xy[1])
+        self.velocity[0] = float(vel_xy[0])
+        self.velocity[1] = float(vel_xy[1])
+        self._apply_boundary()
 
-        # 随机化初始相位，让训练看到更多样的轨迹
-        self._phi_x = rng.uniform(0.0, 2.0 * np.pi)
-        self._phi_y = rng.uniform(0.0, 2.0 * np.pi)
-
-    def step(self) -> Tuple[np.ndarray, np.ndarray]:
-        """推进平台一个 timestep，返回 (position, velocity)。"""
+    def step(self) -> Dict[str, np.ndarray]:
         self._t += self.dt
-        t    = self._t
-        cfg  = self.cfg
-        ax   = cfg.motion_amplitude_x
-        ay   = cfg.motion_amplitude_y
-        ω    = 2.0 * np.pi * cfg.motion_frequency
-        φx   = self._phi_x
-        φy   = self._phi_y
 
-        if self._motion == "static":
-            pass  # position/velocity stay zero
+        speed = self._speed_ctrl.step(self.dt) if self._speed_ctrl else None
+        pos_xy, vel_xy = self._motion_strategy.step(
+            self.dt, self._t, self.cfg, speed,
+        )
 
-        elif self._motion == "linear":
-            self.position[0] = ax * np.sin(ω * t + φx)
-            self.position[1] = 0.0
-            self.velocity[0] = ax * ω * np.cos(ω * t + φx)
-            self.velocity[1] = 0.0
+        self.position[0] = pos_xy[0]
+        self.position[1] = pos_xy[1]
+        self.velocity[0] = vel_xy[0]
+        self.velocity[1] = vel_xy[1]
 
-        elif self._motion == "sinusoidal":
-            # X/Y 使用不同频率，避免纯周期重复模式
-            self.position[0] = ax * np.sin(ω       * t + φx)
-            self.position[1] = ay * np.sin(ω * 0.7 * t + φy)
-            self.velocity[0] = ax * ω       * np.cos(ω       * t + φx)
-            self.velocity[1] = ay * ω * 0.7 * np.cos(ω * 0.7 * t + φy)
-
-        elif self._motion == "figure8":
-            # 伯努利双纽线（归一化）
-            s        = ω * t + φx
-            denom    = 1.0 + np.sin(s) ** 2
-            px       = ax * np.cos(s) / denom
-            py       = ay * np.sin(s) * np.cos(s) / denom
-            # 数值导数
-            ds       = ω * self.dt
-            s1       = s + ds
-            d1       = 1.0 + np.sin(s1) ** 2
-            self.velocity[0] = (ax * np.cos(s1) / d1 - px) / self.dt
-            self.velocity[1] = (ay * np.sin(s1) * np.cos(s1) / d1 - py) / self.dt
-            self.position[0] = px
-            self.position[1] = py
+        self._apply_boundary()
 
         return self.get_state()
+
+    def _apply_boundary(self) -> None:
+        if self._boundary_xy is not None:
+            self.position[0] = float(np.clip(
+                self.position[0], -self._boundary_xy, self._boundary_xy
+            ))
+            self.position[1] = float(np.clip(
+                self.position[1], -self._boundary_xy, self._boundary_xy
+            ))
 
     def get_state(self) -> Dict[str, np.ndarray]:
         return {

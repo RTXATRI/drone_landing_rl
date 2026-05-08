@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
                    help="TensorBoard and runtime log root directory")
     p.add_argument("--model_dir",    type=str,   default=defaults.model_dir,
                    help="Checkpoint and final model root directory")
+    p.add_argument("--mix_ratio",   type=float, default=0.0,
+                   help="穿插训练比例：使用前一课程策略的回合占比（0.0-1.0，默认 0.0 不开启）")
     p.add_argument("--csv_dir",      type=str,   default=defaults.csv_dir,
                    help="CSV output root directory")
     args = p.parse_args()
@@ -110,6 +112,7 @@ def main() -> None:
         train_config = train_config,
         resume_path = args.resume,
         start_stage = args.stage,
+        mix_ratio = args.mix_ratio,
     )
     trainer.train()
 

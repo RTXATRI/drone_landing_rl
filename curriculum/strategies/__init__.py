@@ -7,16 +7,16 @@ from typing import Dict, Tuple, Type
 from configs.env_config import EnvConfig
 from curriculum.strategies.base_strategy import CurriculumStrategy
 from curriculum.strategies.stage1_hover_static import Stage1HoverStaticStrategy
-from curriculum.strategies.stage2_land_static import Stage2LandStaticStrategy
-from curriculum.strategies.stage3_hover_moving import Stage3HoverMovingStrategy
-from curriculum.strategies.stage4_land_moving import Stage4LandMovingStrategy
+from curriculum.strategies.stage2_hover_moving import Stage2HoverMovingStrategy
+from curriculum.strategies.stage3 import Stage3Strategy
+from curriculum.strategies.stage4 import Stage4Strategy
 
 
 STRATEGY_MAP: Dict[int, Type[CurriculumStrategy]] = {
     1: Stage1HoverStaticStrategy,
-    2: Stage2LandStaticStrategy,
-    3: Stage3HoverMovingStrategy,
-    4: Stage4LandMovingStrategy,
+    2: Stage2HoverMovingStrategy,
+    3: Stage3Strategy,
+    4: Stage4Strategy,
 }
 
 
@@ -56,17 +56,8 @@ def is_hover_stage(stage: int) -> bool:
     return bool(get_strategy_class(stage).hover_stage)
 
 
-def registered_episode_metric_keys() -> Tuple[str, ...]:
-    keys = []
-    for strategy_cls in STRATEGY_MAP.values():
-        for key in strategy_cls.episode_metrics:
-            if key not in keys:
-                keys.append(key)
-    return tuple(keys)
-
-
 def episode_info_keywords() -> Tuple[str, ...]:
-    return ("success", "episode_stage", *registered_episode_metric_keys())
+    return ("success", "episode_stage", "train_score", "eval_score")
 
 
 STAGE_LABELS = {stage: get_stage_label(stage) for stage in registered_stage_ids()}

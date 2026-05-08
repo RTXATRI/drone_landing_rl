@@ -75,8 +75,10 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         if strategy is None:
             raise TypeError("BaseDroneLandingEnv requires a CurriculumStrategy instance.")
         strategy.config = env_config
-        self.strategy = strategy
-        self.curriculum_stage = int(strategy.stage_id())
+        self._strategies: dict = {}
+        self._mix_ratio: float = 0.0
+        self._nominal_stage: int = 1
+        self.set_strategy(strategy)
 
         obs_low, obs_high = self._observation_bounds()
         self.observation_space = spaces.Box(
@@ -96,6 +98,7 @@ class BaseDroneLandingEnv(gym.Env, ABC):
 
         # 策略可选的连续保持步数，供具体奖励函数使用。
         self._hover_hold_steps: int = 0
+        self._platform_state_filtered: Dict[str, np.ndarray] = {}
         self._hover_total_hold_steps: int = 0
         self._current_hover_height: float = 2.0
         self._stage1_r_hold_total: float = 0.0
@@ -217,13 +220,19 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         return int(self.strategy.stage_id())
 
     def set_strategy(self, strategy: CurriculumStrategy) -> None:
-        """切换下一次 reset 使用的活动课程策略。"""
+        """切换活动课程策略，同时缓存实例供穿插训练使用。"""
         if strategy is None:
             raise TypeError("set_strategy() requires a CurriculumStrategy instance.")
         strategy.config = self.config
         self.strategy = strategy
         self.curriculum_stage = int(strategy.stage_id())
+        self._nominal_stage = int(strategy.stage_id())
         self._current_hover_height = float(strategy.get_hover_height())
+        self._strategies[strategy.stage_id()] = strategy
+
+    def enable_mix_training(self, mix_ratio: float) -> None:
+        """启用穿插训练：每回合以 mix_ratio 概率使用前一课程策略。"""
+        self._mix_ratio = float(np.clip(mix_ratio, 0.0, 1.0))
 
     def set_hover_height(self, height: float) -> None:
         """设置支持悬停高度的活动策略目标高度。"""
@@ -250,6 +259,7 @@ class BaseDroneLandingEnv(gym.Env, ABC):
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
+        self._rng = rng   # 保存供 process_platform_state 使用
 
         self._step_count = 0
         self._prev_action = np.zeros(self.ACT_DIM, dtype=np.float32)
@@ -263,10 +273,25 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         self._stage1_is_refunding_hold = False
         self._randomize_capabilities(rng)
 
+        # 穿插训练：以 mix_ratio 概率切换到前一课程策略
+        if self._mix_ratio > 0.0:
+            prev_stage = self._nominal_stage - 1
+            if prev_stage not in self._strategies:
+                from curriculum.strategies import create_strategy
+                self._strategies[prev_stage] = create_strategy(prev_stage, self.config)
+            if rng.random() < self._mix_ratio:
+                self.strategy = self._strategies[prev_stage]
+                self.curriculum_stage = prev_stage
+            else:
+                self.strategy = self._strategies[self._nominal_stage]
+                self.curriculum_stage = self._nominal_stage
+
         self._reset_simulation(rng)
 
         drone_state = self._get_drone_state()
         platform_state = self._get_platform_state()
+        platform_state = self.strategy.process_platform_state(platform_state, rng)
+        self._platform_state_filtered = platform_state
         self._reset_hold_tracking()
         self.strategy.reset_episode_metrics(self, drone_state, platform_state)
         obs = self._build_observation(drone_state, platform_state)
@@ -291,6 +316,10 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         # 2. 观测新状态
         drone_state = self._get_drone_state()
         platform_state = self._get_platform_state()
+        platform_state = self.strategy.process_platform_state(
+            platform_state, getattr(self, "_rng", None),
+        )
+        self._platform_state_filtered = platform_state
 
         # 3. 计算观测
         obs = self._build_observation(drone_state, platform_state)
@@ -552,15 +581,24 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         dp  = drone_state["position"]
         pp  = platform_state["position"]
 
-        horiz_dist = np.linalg.norm(dp[:2] - pp[:2])
-
-        # 越界
-        if horiz_dist > self.config.episode.max_horiz_dist:
-            return True, {"termination": "oob", "success": False}
-
-        # 低于地面
-        if dp[2] < self.config.episode.min_height:
-            return True, {"termination": "below_ground", "success": False}
+        # 绝对地图边界（策略可覆盖）
+        map_bounds = self.strategy.get_map_bounds()
+        if map_bounds is not None:
+            xy_limit, z_min, z_max = map_bounds
+            if abs(dp[0]) > xy_limit or abs(dp[1]) > xy_limit:
+                return True, {"termination": "oob", "success": False}
+            if dp[2] < z_min:
+                return True, {"termination": "below_ground", "success": False}
+        else:
+            # 相对平台 OOB
+            horiz_dist = np.linalg.norm(dp[:2] - pp[:2])
+            oob_limit = self.strategy.get_max_horiz_dist()
+            if oob_limit is None:
+                oob_limit = self.config.episode.max_horiz_dist
+            if horiz_dist > oob_limit:
+                return True, {"termination": "oob", "success": False}
+            if dp[2] < self.config.episode.min_height:
+                return True, {"termination": "below_ground", "success": False}
 
         # 由策略负责的成功/接触终止。
         return self.strategy.check_success(

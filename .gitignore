@@ -25,8 +25,7 @@ logs/*
 !logs/.gitkeep
 models/*
 !models/.gitkeep
-data/csv/*
-!data/csv/.gitkeep
+data/
 
 # TensorBoard / logs
 events.out.tfevents.*

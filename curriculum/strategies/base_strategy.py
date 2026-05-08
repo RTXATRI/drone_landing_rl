@@ -4,6 +4,29 @@
 
 每个课程阶段独立负责目标点、场景设置、奖励、成功条件和日志字段。
 通用 RewardCalculator 已退役；具体奖励必须放在具体策略中。
+
+设计规范
+========
+
+奖励参数应 **就近放置在使用位置**，避免集中在类顶部作为远距离常量区。
+
+推荐做法（参数在公式上方就地定义）::
+
+    def compute_reward(self, ...):
+        # ── 位置奖励：高斯接近奖励 ──
+        POS_XY_SIGMA = 0.25    # σ 越小奖励越集中，追踪越紧
+        r_pos = 3.0 * exp(-horiz_err² / (2 * POS_XY_SIGMA²))
+
+避免做法（远距离 config 区，需要上下滚动对照）::
+
+    class MyStrategy:
+        POS_XY_SIGMA = 0.25   # 定义在 100+ 行之前
+        ...
+        def compute_reward(self, ...):   # 参数名和公式分离
+            r_pos = self.POS_XY_SIGMA * ...
+
+例外：被多个方法共享的参数（如 HOLD_RADIUS、TRAIN_SUCCESS_RADIUS）
+保留为类级常量，集中在类顶部并标注行内注释说明作用。
 """
 
 from __future__ import annotations
@@ -14,6 +37,7 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 from configs.env_config import EnvConfig
+from envs.landing_platform.motions.base import MotionStrategy
 
 
 class CurriculumStrategy(ABC):
@@ -142,6 +166,31 @@ class CurriculumStrategy(ABC):
             for key in self.episode_metric_keys()
         }
 
+    # ── 策略层 hooks（默认实现，子类按需重写）──────────────────────────────────
+
+    def process_platform_state(
+        self, raw_state: dict, rng: np.random.Generator | None = None
+    ) -> dict:
+        """对原始平台状态进行策略级预处理（噪声+滤波等）。默认透传。"""
+        return raw_state
+
+    def get_max_horiz_dist(self) -> float | None:
+        """覆盖 OOB 判断距离。返回 None 使用 EpisodeConfig 默认值 (45.0m)。
+        若 get_map_bounds() 返回非 None，则优先使用绝对地图边界。"""
+        return None
+
+    def get_map_bounds(self) -> Tuple[float, float, float] | None:
+        """返回 (abs_xy_limit, abs_z_min, abs_z_max) 或 None 使用默认相对OOB。"""
+        return None
+
+    def get_spawn_position(
+        self, platform_pos: np.ndarray, rng: np.random.Generator,
+    ) -> np.ndarray | None:
+        """返回无人机出生位置 (世界系 3D)，None 使用默认圆柱出生。"""
+        return None
+
+    # ── 辅助 ──────────────────────────────────────────────────────────────────
+
     def set_hover_height(self, height: float) -> None:
         self._hover_height = float(height)
 
@@ -154,12 +203,14 @@ class HoverStrategyMixin:
 
     hover_stage = True
 
-    def _setup_hover_scene(self, env: Any, rng: np.random.Generator, motion: str) -> None:
+    def _setup_hover_scene(
+        self, env: Any, rng: np.random.Generator, motion_strategy: MotionStrategy,
+    ) -> None:
         cfg = self.config.episode
         height = float(rng.uniform(cfg.hover_height_min, cfg.hover_height_max))
         self.set_hover_height(height)
         env._current_hover_height = height
-        env._platform.set_motion(motion)
+        env._platform.set_motion_strategy(motion_strategy)
 
     def get_target_pos(self, platform_pos: np.ndarray) -> np.ndarray:
         return platform_pos + np.array([0.0, 0.0, self.get_hover_height()])
@@ -179,8 +230,10 @@ class LandingStrategyMixin:
 
     hover_stage = False
 
-    def _setup_landing_scene(self, env: Any, rng: np.random.Generator, motion: str) -> None:
-        env._platform.set_motion(motion)
+    def _setup_landing_scene(
+        self, env: Any, rng: np.random.Generator, motion_strategy: MotionStrategy,
+    ) -> None:
+        env._platform.set_motion_strategy(motion_strategy)
 
     def get_target_pos(self, platform_pos: np.ndarray) -> np.ndarray:
         return platform_pos + np.array([0.0, 0.0, self.config.platform.half_extents[2]])

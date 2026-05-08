@@ -76,11 +76,13 @@ class Trainer:
         train_config: TrainConfig,
         resume_path: Optional[str] = None,
         start_stage: int = 1,
+        mix_ratio: float = 0.0,
     ):
         self.env_cfg      = env_config
         self.cfg          = train_config
         self.resume_path  = resume_path
         self.start_stage  = start_stage
+        self.mix_ratio    = float(mix_ratio)
 
         # 日志设置
         run_dir = os.path.join(train_config.log_dir, train_config.exp_name)
@@ -180,7 +182,12 @@ class Trainer:
     def _activate_stage(self, vec_env: VecMonitor, stage: int) -> np.ndarray:
         """广播手动选择的阶段，并开始一批干净的新 episode。"""
         logger.info(f"Activating Stage {stage} {STAGE_SHORT_LABELS[stage]} on all envs.")
+        if self.mix_ratio > 0.0 and stage > 1:
+            # 预缓存前置课程策略（修复 Bug 3：直接从当前课程启动时前置不存在）
+            vec_env.env_method("set_strategy", create_strategy(stage - 1, self.env_cfg))
         vec_env.env_method("set_strategy", create_strategy(stage, self.env_cfg))
+        if self.mix_ratio > 0.0 and stage > 1:
+            vec_env.env_method("enable_mix_training", self.mix_ratio)
         return vec_env.reset()
 
     def _stage_budget(self, stage: int) -> int:

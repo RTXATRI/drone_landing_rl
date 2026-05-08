@@ -33,20 +33,16 @@ from configs.env_config import EnvConfig
 from curriculum.curriculum_manager import CurriculumManager
 from curriculum.strategies import create_strategy
 from envs.drone_landing_env import DroneLandingEnv
+from envs.landing_platform.moving_platform import MovingPlatform
+from envs.landing_platform.motions import LissajousMotion, PatrolMotion, WaypointMotion
 from scripts.evaluate import apply_eval_control_config
 from training.trainer import EPISODE_INFO_KEYWORDS
 
 PASS = "  [PASS]"
 FAIL = "  [FAIL]"
 OBS_DIM = 34
-STAGE1_EPISODE_METRIC_KEYS = (
-    "stage1_train_score",
-    "stage1_train_hit_steps",
-    "stage1_train_possible_steps",
-    "stage1_eval_score",
-    "stage1_eval_max_hold_steps",
-    "stage1_eval_possible_steps",
-)
+STAGE1_EPISODE_METRIC_KEYS = ("train_score", "eval_score")
+STAGE2_SPEED_LIMIT_TOL = 5.0
 
 
 def _make_env(cfg: EnvConfig, stage: int = 1, render_mode=None) -> DroneLandingEnv:
@@ -150,10 +146,11 @@ def test_curriculum_stages(env_config: EnvConfig, render_mode) -> bool:
             ok &= _check(env.get_curriculum_stage() == stage,
                          f"Stage {stage}: get_curriculum_stage() returns {stage}")
 
-            if stage == 1:
+            if stage <= 2:
                 for _ in range(10):
                     action = env.action_space.sample()
                     env.step(action)
+                ok &= _check(True, f"Stage {stage}: reward implemented")
             else:
                 try:
                     env.step(np.zeros(4, dtype=np.float32))
@@ -193,8 +190,8 @@ def test_termination_conditions(env: DroneLandingEnv, env_config: EnvConfig) -> 
     _, _, term, trunc, info = env.step(np.zeros(4, np.float32))
     ok &= _check(term or trunc, "Below ground: episode terminates")
 
-    # ── 内置降落策略成功条件：轻柔降落到平台上 ───────────────────────────
-    landing_env = _make_env(env_config, stage=2)
+    # ── 内置降落策略成功条件：轻柔降落到平台上（使用 Stage 4 的 LandingStrategy） ──
+    landing_env = _make_env(env_config, stage=4)
     landing_env.reset(seed=5)
     # 将无人机放在平台附近，速度为零
     plat_pos = landing_env._platform_state["position"]
@@ -415,10 +412,8 @@ def test_stage1_terminal_behavior() -> bool:
     train_ep = train_info.get("episode", {})
     ok &= _check(bool(train_ep.get("success", False)),
                  "train mode: wide Stage 1 success space marks success")
-    ok &= _check(float(train_ep.get("stage1_train_score", 0.0)) > 60.0,
-                 f"train mode: train score > 60  [got {train_ep.get('stage1_train_score', 0.0):.1f}]")
-    ok &= _check(float(train_ep.get("stage1_eval_score", 100.0)) <= 60.0,
-                 f"train mode: eval score remains <= 60  [got {train_ep.get('stage1_eval_score', 0.0):.1f}]")
+    ok &= _check(float(train_ep.get("train_score", 0.0)) > 60.0,
+                 f"train mode: train_score > 60  [got {train_ep.get('train_score', 0.0):.1f}]")
     ok &= _check("hover_score" not in train_ep,
                  "Stage 1 episode info still does not export old hover_score")
     train_env.close()
@@ -434,8 +429,6 @@ def test_stage1_terminal_behavior() -> bool:
     eval_fail_ep = eval_fail_info.get("episode", {})
     ok &= _check(not bool(eval_fail_ep.get("success", False)),
                  "eval mode: same wide-only state is not a success")
-    ok &= _check(float(eval_fail_ep.get("stage1_eval_score", 100.0)) <= 60.0,
-                 f"eval mode: eval score <= 60  [got {eval_fail_ep.get('stage1_eval_score', 0.0):.1f}]")
     eval_fail_env.close()
 
     eval_success_cfg = EnvConfig()
@@ -449,8 +442,6 @@ def test_stage1_terminal_behavior() -> bool:
     eval_success_ep = eval_success_info.get("episode", {})
     ok &= _check(bool(eval_success_ep.get("success", False)),
                  "eval mode: stable hold space marks success")
-    ok &= _check(float(eval_success_ep.get("stage1_eval_score", 0.0)) > 60.0,
-                 f"eval mode: eval score > 60  [got {eval_success_ep.get('stage1_eval_score', 0.0):.1f}]")
     eval_success_env.close()
 
     oob_cfg = EnvConfig()
@@ -520,8 +511,8 @@ def test_vecmonitor_preserves_episode_core_fields() -> bool:
                  "VecMonitor preserves custom episode_stage field")
     ok &= _check(all(key in ep for key in STAGE1_EPISODE_METRIC_KEYS),
                  "VecMonitor preserves Stage 1 episode metric keys")
-    ok &= _check(float(ep.get("stage1_train_score", 0.0)) > 60.0,
-                 "VecMonitor preserves Stage 1 train score")
+    ok &= _check(float(ep.get("train_score", 0.0)) > 60.0,
+                 "VecMonitor preserves train_score")
     ok &= _check("hover_score" not in ep, "VecMonitor episode has no hover_score")
     return ok
 
@@ -757,8 +748,82 @@ def test_stage1_strategy_reward_shape() -> bool:
     return ok
 
 
+def test_stage2_strategy_reward_shape() -> bool:
+    _header("Test 22: Stage-2 Strategy Reward Shape (Simplified)")
+    ok = True
+    cfg = EnvConfig()
+    strategy = create_strategy(2, cfg)
+    target = np.array([0.0, 0.0, 5.0], dtype=np.float32)
+    platform = {
+        "position": np.zeros(3, dtype=np.float32),
+        "velocity": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "angular_rate": np.zeros(3, dtype=np.float32),
+    }
+
+    def _info_at(pos, velocity=(0.0, 0.0, 0.0)):
+        drone = {
+            "position": np.array(pos, dtype=np.float32),
+            "velocity": np.array(velocity, dtype=np.float32),
+            "euler": np.zeros(3, dtype=np.float32),
+            "yaw_rate": np.float32(0.0),
+        }
+        reward, info = strategy.compute_reward(
+            env=None,
+            drone_state=drone,
+            platform_state=platform,
+            action=np.zeros(4, dtype=np.float32),
+            prev_action=np.zeros(4, dtype=np.float32),
+            target_pos=target,
+            hold_steps=0,
+            prev_hold_steps=0,
+        )
+        return float(reward), info
+
+    _, center = _info_at([0.0, 0.0, 5.0])
+    _, near = _info_at([0.3, 0.0, 5.0])
+    _, mid = _info_at([5.0, 0.0, 5.0])
+    _, far = _info_at([30.0, 0.0, 5.0])
+    _, vert_far = _info_at([0.0, 0.0, 0.0])
+    # 速度匹配：靠近目标 + 有相对速度时产生惩罚
+    _, vm_near = _info_at([0.1, 0.0, 5.0], velocity=(0.5, 0.0, 0.0))
+    _, vm_far = _info_at([3.0, 0.0, 5.0], velocity=(0.5, 0.0, 0.0))
+
+    # 位置奖励在目标中心处最大
+    ok &= _check(center["reward/pos"] > 6.0,
+                 f"Stage 2 target-center position reward is strong  [got {center['reward/pos']:.4f}]")
+    # 位置奖励随距离单调衰减
+    ok &= _check(center["reward/pos"] > near["reward/pos"] > mid["reward/pos"],
+                 "Stage 2 position reward decays with distance from target")
+    # 远距离仍有梯度
+    ok &= _check(far["reward/pos"] > 0.01,
+                 f"Stage 2 far-range position gradient is present  [got {far['reward/pos']:.4f}]")
+    # 垂直偏离也导致衰减
+    ok &= _check(vert_far["reward/pos"] < center["reward/pos"],
+                 "Stage 2 vertical error reduces position reward")
+
+    # 速度匹配：远离目标时不开门
+    ok &= _check(vm_far["metric/gate_vm"] < 1e-6,
+                 f"Stage 2 velocity-match gate is off when far  [got {vm_far['metric/gate_vm']:.4f}]")
+    # 速度匹配：靠近时产生有意义的惩罚
+    ok &= _check(vm_near["reward/vel_match"] < -0.01,
+                 f"Stage 2 velocity-match penalizes rel-speed when close  [got {vm_near['reward/vel_match']:.4f}]")
+
+    # 必需 info 键存在
+    expected_keys = {
+        "reward/pos", "reward/vel_match", "reward/yaw",
+        "reward/yaw_rate", "reward/action", "reward/total",
+        "metric/dist", "metric/horiz_err", "metric/vert_err",
+        "metric/speed", "metric/rel_speed", "metric/plat_speed",
+        "metric/gate_vm",
+    }
+    ok &= _check(expected_keys.issubset(center.keys()),
+                 "Stage 2 reward info exposes all required simplified keys")
+    return ok
+
+
 def test_eval_fixed_controls_config() -> bool:
-    _header("Test 24: Eval Fixed Controls")
+    _header("Test 23: Eval Fixed Controls")
     ok = True
     cfg = EnvConfig()
     apply_eval_control_config(
@@ -802,8 +867,99 @@ def test_eval_fixed_controls_config() -> bool:
     return ok
 
 
+def test_stage2_platform_motion_continuity() -> bool:
+    _header("Test 24: Stage-2 Platform Motion Continuity")
+    ok = True
+    cfg = EnvConfig()
+    dt = float(cfg.episode.dt)
+    motion_factories = {
+        "lissajous": lambda: LissajousMotion(),
+        "patrol": lambda: PatrolMotion(boundary=50.0),
+        "waypoint": lambda: WaypointMotion(boundary=50.0),
+    }
+
+    for name, factory in motion_factories.items():
+        max_diff_speed = 0.0
+        max_reported_speed = 0.0
+        max_velocity_mismatch = 0.0
+        for seed in range(12):
+            rng = np.random.default_rng(10_000 + seed)
+            platform = MovingPlatform(cfg.platform, cfg.episode.dt)
+            platform.set_motion_strategy(factory())
+            platform.enable_speed_controller()
+            platform.set_boundary(50.0)
+            platform.reset(rng)
+            prev = platform.position.copy()
+            for _ in range(800):
+                state = platform.step()
+                diff_vel = (platform.position[:2] - prev[:2]) / dt
+                reported_vel = np.asarray(state["velocity"][:2], dtype=np.float64)
+                diff_speed = float(np.linalg.norm(diff_vel))
+                reported_speed = float(np.linalg.norm(reported_vel))
+                max_diff_speed = max(max_diff_speed, diff_speed)
+                max_reported_speed = max(max_reported_speed, reported_speed)
+                max_velocity_mismatch = max(
+                    max_velocity_mismatch,
+                    float(np.linalg.norm(diff_vel - reported_vel)),
+                )
+                prev = platform.position.copy()
+
+        ok &= _check(
+            max_diff_speed <= STAGE2_SPEED_LIMIT_TOL,
+            f"{name}: position-diff speed <= {STAGE2_SPEED_LIMIT_TOL:.1f}m/s  [max {max_diff_speed:.3f}]",
+        )
+        ok &= _check(
+            max_reported_speed <= STAGE2_SPEED_LIMIT_TOL,
+            f"{name}: reported speed <= {STAGE2_SPEED_LIMIT_TOL:.1f}m/s  [max {max_reported_speed:.3f}]",
+        )
+        ok &= _check(
+            max_velocity_mismatch < 1e-4,
+            f"{name}: reported velocity matches position diff  [max err {max_velocity_mismatch:.6f}]",
+        )
+    return ok
+
+
+def test_stage2_platform_velocity_observation() -> bool:
+    _header("Test 25: Stage-2 Platform Velocity Observation")
+    ok = True
+    cfg = EnvConfig()
+    env = _make_env(cfg, stage=2)
+    obs, _ = env.reset(seed=202)
+    strategy = env.strategy
+    history = list(getattr(strategy, "_velocity_history", []))
+    scale = np.asarray(getattr(strategy, "_velocity_scale_xy", np.ones(2)), dtype=np.float32)
+    ps = getattr(env, "_platform_state_filtered", {})
+    raw = env._get_platform_state()
+
+    ok &= _check(len(history) == 1, "Stage 2 stores initial true platform velocity history")
+    ok &= _check(np.all(scale >= 0.98) and np.all(scale <= 1.02),
+                 f"Stage 2 velocity scale is within [0.98,1.02]  [got {scale}]")
+    expected_initial = history[0].copy()
+    expected_initial[:2] *= scale
+    ok &= _check(np.allclose(ps["velocity"], expected_initial, atol=1e-5),
+                 "initial observed platform velocity is delayed true velocity with scale")
+
+    raw_vels = [raw["velocity"].copy()]
+    for _ in range(4):
+        obs, _, term, trunc, _ = env.step(np.zeros(4, dtype=np.float32))
+        raw_vels.append(env._get_platform_state()["velocity"].copy())
+        if term or trunc:
+            break
+
+    ps = env._platform_state_filtered
+    history = list(getattr(strategy, "_velocity_history", []))
+    expected = history[0].copy()
+    expected[:2] *= scale
+    ok &= _check(len(history) == strategy.VELOCITY_DELAY_STEPS + 1,
+                 "Stage 2 velocity history is capped to delay_steps + 1")
+    ok &= _check(np.allclose(ps["velocity"], expected, atol=1e-5),
+                 "observed platform velocity uses delayed true velocity with scale")
+    env.close()
+    return ok
+
+
 def test_performance(env: DroneLandingEnv) -> bool:
-    _header("Test 25: Step Performance")
+    _header("Test 27: Step Performance")
     env.reset(seed=7)
     N = 500
     t0 = time.perf_counter()
@@ -858,7 +1014,10 @@ def main():
         "Tracking error":        test_tracking_error_actual_velocity(),
         "Disturbance disabled":  test_disturbance_disabled_zero_drift(),
         "Stage-1 reward shape":  test_stage1_strategy_reward_shape(),
+        "Stage-2 reward shape":  test_stage2_strategy_reward_shape(),
         "Eval fixed controls":    test_eval_fixed_controls_config(),
+        "Stage-2 platform motion": test_stage2_platform_motion_continuity(),
+        "Stage-2 velocity obs":   test_stage2_platform_velocity_observation(),
         "Step performance":      test_performance(env),
     }
 

@@ -31,7 +31,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from stable_baselines3 import SAC
@@ -82,9 +82,18 @@ TRAJ_COLS = [
     "platform_vx",
     "platform_vy",
     "platform_vz",
+    "platform_fx",
+    "platform_fy",
+    "platform_fz",
+    "platform_fvx",
+    "platform_fvy",
+    "platform_fvz",
     "target_x",
     "target_y",
     "target_z",
+    "target_fx",
+    "target_fy",
+    "target_fz",
     "dist_3d",
     "dist_xy",
     "speed_norm",
@@ -105,9 +114,8 @@ TRAJ_EP_SUMMARY_COLS = [
     "success",
     "reward",
     "length",
-    "stage1_eval_score",
-    "stage1_eval_max_hold_steps",
-    "stage1_eval_possible_steps",
+    "train_score",
+    "eval_score",
     "min_dist",
     "sim_time_sec",
     "wall_time_sec",
@@ -575,7 +583,7 @@ def evaluate_stage(
         strategy=create_strategy(stage, env_config),
         render_mode=render_mode,
     )
-    if stage == 1:
+    if is_hover_stage(stage):
         env.set_success_mode("eval")
 
     # GUI 模式下限制循环速度，让推演过程肉眼可观察。
@@ -686,8 +694,11 @@ def evaluate_stage(
                 if need_state:
                     ds = env._get_drone_state()
                     ps = env._get_platform_state()
+                    fps = getattr(env, '_platform_state_filtered', None) or {}
                 if traj_enable or realtime_enabled:
                     target_pos = env._get_target_pos(ps["position"])
+                    if fps:
+                        ftarget_pos = fps["position"] + np.array([0, 0, env.get_hover_height()], dtype=np.float32)
 
                 sim_time = ep_len * float(env_config.episode.dt)
                 if traj_enable and ds is not None and ps is not None and target_pos is not None:
@@ -720,9 +731,18 @@ def evaluate_stage(
                             "platform_vx": round(float(ps["velocity"][0]), 6),
                             "platform_vy": round(float(ps["velocity"][1]), 6),
                             "platform_vz": round(float(ps["velocity"][2]), 6),
+                            "platform_fx": round(float(fps.get("position", ps["position"])[0]), 6) if fps else round(float(ps["position"][0]), 6),
+                            "platform_fy": round(float(fps.get("position", ps["position"])[1]), 6) if fps else round(float(ps["position"][1]), 6),
+                            "platform_fz": round(float(fps.get("position", ps["position"])[2]), 6) if fps else round(float(ps["position"][2]), 6),
+                            "platform_fvx": round(float(fps.get("velocity", ps["velocity"])[0]), 6) if fps else round(float(ps["velocity"][0]), 6),
+                            "platform_fvy": round(float(fps.get("velocity", ps["velocity"])[1]), 6) if fps else round(float(ps["velocity"][1]), 6),
+                            "platform_fvz": round(float(fps.get("velocity", ps["velocity"])[2]), 6) if fps else round(float(ps["velocity"][2]), 6),
                             "target_x": round(float(target_pos[0]), 6),
                             "target_y": round(float(target_pos[1]), 6),
                             "target_z": round(float(target_pos[2]), 6),
+                            "target_fx": round(float(ftarget_pos[0]), 6) if fps else round(float(target_pos[0]), 6),
+                            "target_fy": round(float(ftarget_pos[1]), 6) if fps else round(float(target_pos[1]), 6),
+                            "target_fz": round(float(ftarget_pos[2]), 6) if fps else round(float(target_pos[2]), 6),
                             "dist_3d": round(dist_3d, 6),
                             "dist_xy": round(dist_xy, 6),
                             "speed_norm": round(speed_norm, 6),
@@ -752,12 +772,28 @@ def evaluate_stage(
                     rt_vy.append(float(ds["velocity"][1]))
                     rt_vz.append(float(ds["velocity"][2]))
                     rt_vnorm.append(float(np.linalg.norm(ds["velocity"])))
+                    rt_fpx = getattr(env, '_rt_fpx', None)
+                    if rt_fpx is None:
+                        env._rt_fpx = []; env._rt_fpy = []; env._rt_fpz = []
+                        env._rt_ftx = []; env._rt_fty = []; env._rt_ftz = []
+                        env._rt_fpv = []
+                    if fps:
+                        env._rt_fpx.append(float(fps["position"][0]))
+                        env._rt_fpy.append(float(fps["position"][1]))
+                        env._rt_fpz.append(float(fps["position"][2]))
+                        env._rt_ftx.append(float(ftarget_pos[0]))
+                        env._rt_fty.append(float(ftarget_pos[1]))
+                        env._rt_ftz.append(float(ftarget_pos[2]))
+                        env._rt_fpv.append(float(np.linalg.norm(fps["velocity"])))
 
                     if (ep_len % traj_realtime_refresh == 0) or done:
                         rt_ax3d.cla()
                         rt_ax3d.plot(rt_dx, rt_dy, rt_dz, color="tab:blue", label="drone")
                         rt_ax3d.plot(rt_px, rt_py, rt_pz, color="tab:red", alpha=0.7, label="platform")
                         rt_ax3d.plot(rt_tx, rt_ty, rt_tz, color="tab:green", ls="--", alpha=0.8, label="target")
+                        if env._rt_fpx:
+                            rt_ax3d.plot(env._rt_fpx, env._rt_fpy, env._rt_fpz, color="tab:red", ls=":", alpha=0.5, label="plat(f)")
+                            rt_ax3d.plot(env._rt_ftx, env._rt_fty, env._rt_ftz, color="tab:green", ls=":", alpha=0.5, label="tgt(f)")
                         if rt_px:
                             _draw_platform_outline(
                                 rt_ax3d,
@@ -785,6 +821,8 @@ def evaluate_stage(
                         rt_ax_speed.plot(rt_t, rt_vy, label="vy")
                         rt_ax_speed.plot(rt_t, rt_vz, label="vz")
                         rt_ax_speed.plot(rt_t, rt_vnorm, label="|v|", lw=2.0)
+                        if env._rt_fpv:
+                            rt_ax_speed.plot(rt_t, env._rt_fpv, color="tab:red", ls=":", label="|v|_plat(f)", lw=1.5)
                         rt_ax_speed.set_title("Velocity vs Sim Time")
                         rt_ax_speed.set_xlabel("sim time (s)")
                         rt_ax_speed.set_ylabel("velocity (m/s)")
@@ -825,13 +863,9 @@ def evaluate_stage(
 
             success = info.get("episode", {}).get("success", False)
             episode_info = info.get("episode", {})
-            stage1_eval_score = float(episode_info.get("stage1_eval_score", 0.0))
-            stage1_eval_max_hold_steps = int(
-                episode_info.get("stage1_eval_max_hold_steps", 0)
-            )
-            stage1_eval_possible_steps = int(
-                episode_info.get("stage1_eval_possible_steps", 0)
-            )
+            train_score_val = float(episode_info.get("train_score", 0.0))
+            eval_score_val = float(episode_info.get("eval_score", 0.0))
+
             ep_wall = max(time.perf_counter() - ep_wall_t0, 1e-9)
             ep_sim = ep_len * env_config.episode.dt
             ep_rate = ep_sim / ep_wall
@@ -853,9 +887,8 @@ def evaluate_stage(
                     "success": int(success),
                     "reward": round(float(ep_r), 6),
                     "length": ep_len,
-                    "stage1_eval_score": round(stage1_eval_score, 3),
-                    "stage1_eval_max_hold_steps": stage1_eval_max_hold_steps,
-                    "stage1_eval_possible_steps": stage1_eval_possible_steps,
+                    "train_score": round(train_score_val, 3),
+                    "eval_score": round(eval_score_val, 3),
                     "min_dist": round(float(min_d), 6),
                     "sim_time_sec": round(float(ep_sim), 6),
                     "wall_time_sec": round(float(ep_wall), 6),
@@ -865,11 +898,8 @@ def evaluate_stage(
 
             status = "✓ SUCCESS" if success else "✗ FAIL   "
             eval_suffix = ""
-            if stage == 1:
-                eval_suffix = (
-                    f" | EvalScore={stage1_eval_score:.1f}"
-                    f" | MaxHoldSteps={stage1_eval_max_hold_steps}"
-                )
+            if is_hover_stage(stage):
+                eval_suffix = f" | Train={train_score_val:.1f} Eval={eval_score_val:.1f}"
             print(
                 f"  Ep {ep+1:3d}/{n_episodes} | {status} | "
                 f"R={ep_r:+8.2f} | L={ep_len:4d} | minDist={min_d:.2f}m"
@@ -900,7 +930,13 @@ def evaluate_stage(
 
     if traj_enable and traj_stage_dir:
         summary_csv_path = os.path.join(traj_stage_dir, "episode_summary.csv")
-        _write_csv_rows(summary_csv_path, TRAJ_EP_SUMMARY_COLS, traj_episode_rows)
+        summary_cols = [
+            "episode", "stage", "success", "reward", "length",
+            "train_score", "eval_score",
+            "min_dist", "sim_time_sec", "wall_time_sec",
+            "sim_to_real_rate", "traj_csv",
+        ]
+        _write_csv_rows(summary_csv_path, summary_cols, traj_episode_rows)
         meta_path = os.path.join(traj_stage_dir, "stage_meta.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(

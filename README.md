@@ -1,6 +1,6 @@
 # Drone Landing RL 工程总览
 
-此项目还在开发中，目前未完成，最后更新时间：2026-04-28
+此项目还在开发中，目前未完成，最后更新时间：2026-05-05
 
 本文件是工程根目录的总入口说明文档，目标是让开发者、研究者或 AI 助手快速理解这个工程的用途、架构、运行方式、关键参数和当前风险。各主要源码目录内也新增了中文 `README.md`，用于解释该目录的代码职责和后续 ROS/Gazebo 迁移边界。
 
@@ -106,7 +106,14 @@ drone_landing_rl/
 │   │   ├── kinematic_model.py     无人机运动学积分、一阶低通滤波和轻量扰动
 │   │   └── README.md              动力学目录说明
 │   ├── landing_platform/
-│   │   ├── moving_platform.py     平台运动模式：static/linear/sinusoidal/figure8
+│   │   ├── moving_platform.py     平台运动模型（组合模式）
+│   │   ├── speed_controller.py    通用速度控制器
+│   │   ├── motions/               运动策略包
+│   │   │   ├── base.py            策略抽象基类
+│   │   │   ├── static_motion.py   静止策略
+│   │   │   ├── lissajous_motion.py 李萨如曲线策略
+│   │   │   ├── patrol_motion.py   往返巡逻策略
+│   │   │   └── waypoint_motion.py 多边形航点策略
 │   │   └── README.md              平台目录说明
 │   └── rewards/
 │       ├── reward_functions.py    可复用奖励计算工具
@@ -114,6 +121,13 @@ drone_landing_rl/
 │
 ├── curriculum/
 │   ├── curriculum_manager.py      课程统计和手动课程指标
+│   ├── strategies/                课程策略实现与注册
+│   │   ├── base_strategy.py       策略抽象基类 + Mixin
+│   │   ├── kalman_filter.py       平台状态卡尔曼滤波器
+│   │   ├── stage1_hover_static.py 课程一
+│   │   ├── stage2_hover_moving.py 课程二
+│   │   ├── stage3.py              课程三
+│   │   └── stage4.py              课程四
 │   └── README.md                  课程目录说明
 │
 ├── training/
@@ -258,16 +272,17 @@ wind_velocity = base_wind_velocity + gust_velocity
 
 ### 6.4 平台运动模型
 
-`MovingPlatform` 支持：
+`MovingPlatform` 通过组合模式注入运动策略，支持：
 
-| motion_type | 说明 |
-| --- | --- |
-| `static` | 平台静止，可由任意课程策略选择 |
-| `linear` | X 方向正弦往复 |
-| `sinusoidal` | X/Y 独立正弦运动，可由任意课程策略选择 |
-| `figure8` | 8 字轨迹 |
+| 策略 | 类型 | 活动范围 | 使用课程 |
+|------|------|----------|----------|
+| `StaticMotion` | 静止 | 原点 | Stage 1 |
+| `LissajousMotion` | 闭合曲线路径累积 | 幅值 15-35m(X) / 10-30m(Y)，每 ep 随机 | Stage 2/3/4 |
+| `PatrolMotion` | 路径累积 | 原点 ↔ 随机目标 15-40m | Stage 2 |
+| `WaypointMotion` | 路径累积 | 随机多边形 ∈ [-50,50]² | Stage 2 |
 
-课程策略在 episode reset 前通过 `MovingPlatform.set_motion(...)` 指定运动模式。
+课程策略在 episode reset 前通过 `MovingPlatform.set_motion_strategy()` 注入策略实例。
+课程二额外激活统一 `SpeedController`（速度范围约 0.3-4.5 m/s）和边界裁剪（±50m）。三种 Stage 2 移动策略都消费该标量速度并按路径弧长推进，位置差分速度和报告速度均应小于 5m/s。
 新增课程不需要修改平台模型，除非需要新的轨迹形状。
 
 ## 7. 观测空间
@@ -308,9 +323,10 @@ wind_velocity = base_wind_velocity + gust_velocity
 
 当前初始出生范围：
 
-- 水平半径：`3-35m`
-- 高度：`1-30m`
-- 水平出界终止边界：`45m`
+- Stage 1：以原点为中心的圆柱，水平半径 `3-35m`，高度 `1-30m`
+- Stage 2：`[-80,80]²` 外环（排除 `[-50,50]²` 平台活动区），高度 `1-30m`
+- Stage 1 水平出界终止边界：`45m`（相对平台）
+- Stage 2 水平出界终止边界：`±100m`（绝对地图边界），`z≥0`
 
 注意：观测仍保留原归一化和裁剪设置。水平相对位置超过 `20m * 1.5`、相对高度超过 `10m * 1.5` 时会被裁剪到观测上限，但奖励、终止和悬停评分仍使用未裁剪的真实仿真状态。
 
@@ -356,7 +372,28 @@ wind_velocity = base_wind_velocity + gust_velocity
 - 成功/失败判定。
 - 终端奖励和 episode/eval 指标。
 
-阶段切换逻辑：
+### 11.1 已注册课程
+
+| 课程 | 类名 | 描述 | 状态 |
+| --- | --- | --- | --- |
+| Stage 1 | `Stage1HoverStaticStrategy` | 静止平台上悬停 | ✅ 可训练 |
+| Stage 2 | `Stage2HoverMovingStrategy` | 移动平台上悬停（3 种速度受控运动随机池：Lissajous/Patrol/Waypoint，真实速度带延迟/误差） | ✅ 可训练 |
+| Stage 3 | `Stage3Strategy` | 移动平台上悬停（Lissajous 运动） | ❌ 奖励未实现 |
+| Stage 4 | `Stage4Strategy` | 移动平台上降落（Lissajous 运动） | ❌ 奖励未实现 |
+
+Stage 2 每 episode 从 3 种运动模式中随机选择：Lissajous（闭合曲线，幅值 15-35m）、Patrol（原点↔目标 15-40m 往返）、Waypoint（多边形航点 ∈[-50,50]²）。三种运动都由统一 `SpeedController` 控制速度。平台速度观测直接使用仿真真实速度，并加入默认 2 step 延迟和 `Uniform(0.98, 1.02)` 的小比例误差；KF 文件仅作为未来真实传感器版本备用。奖励含 8 组件：位置接近（XY/Z 高斯 σ 放宽至 4.0/2.0，并互相门控：水平 10m 外不给高度奖励、垂直 5m 外不给水平奖励）、相对速度惩罚（XY vel_gate 外沿 3m，Z 外沿 1m）、速度方向对齐（与 r_vel 共用 vel_gate）、朝向目标 shaping（距离尺度 25m，权重 0.6）等。核心差异 vs Stage 1：速度判据从绝对速度改为相对平台速度，新增速度匹配奖励。
+
+### 11.2 穿插训练（仅 Stage 2+ 生效）
+
+训练后续课程时，可通过 `--mix_ratio` 指定一定比例的回合使用前一课程的策略：
+
+```powershell
+conda run --no-capture-output -n drone_rl python scripts\train.py --stage 2 --mix_ratio 0.2
+```
+
+`--mix_ratio 0.2` 表示 20% 的 episode 使用 Stage 1 策略，80% 使用 Stage 2。默认 `0.0` 不开启。穿插回合的 `episode_log.csv` 中 `stage` 列为实际使用的课程编号。TensorBoard 中 `curriculum/actual_mix_ratio` 显示实际混合比例。
+
+### 11.3 阶段切换逻辑
 
 ```text
 训练当前阶段到该阶段预算步数结束
@@ -408,10 +445,11 @@ conda run --no-capture-output -n drone_rl python scripts\train.py
 | `--log_dir` | `./logs` | `--log_dir logs` | TensorBoard 和运行日志根目录 |
 | `--model_dir` | `./models` | `--model_dir models` | checkpoint 和 final 模型根目录 |
 | `--csv_dir` | `./data/csv` | `--csv_dir data/csv` | episode/reward/training CSV 输出根目录 |
+| `--mix_ratio` | `0.0` | `--mix_ratio 0.2` | 穿插训练比例（仅 Stage 2+），使用前一课程策略的回合占比，默认 0.0 不开启 |
 
 训练阶段保持随机化：策略可在 reset 时自行采样场景参数，速度能力也在每个 episode 随机采样。评估入口中的固定控制参数只影响验证，不影响训练。
 
-Stage 1 的训练成功率来自训练口径百分制分数：累计处于水平误差 `<0.20m`、垂直误差 `<0.15m`、实际速度 `<0.15m/s` 的步数，除以按当前 episode 初始距离和速度能力估算的理论可用步数；`stage1_train_score > 60` 记为训练成功，但不增加成功奖励。评估入口会切换为 eval 口径：统计稳定悬停保持空间内的最长连续步数，指标为 `stage1_eval_score` 和 `stage1_eval_max_hold_steps`。
+训练 epsoide 指标统一为 `train_score`（0-100 百分制评分），不区分课程编号前缀。`train_score > 60` 记为训练成功。CSV 中 `episode_log.csv` 精简为 6 列：`timestep, stage, reward, length, success, train_score`。每步奖励分项按课程独立存储在 `reward_log_stageN.csv` 中。
 
 训练时的周期性控制台日志会使用清晰的滚动窗口命名，例如：
 
@@ -557,14 +595,18 @@ http://localhost:6006
 | `train/ent_coef` | SAC 熵系数 |
 | `curriculum/stage` | 当前课程阶段 |
 | `curriculum/rolling_success_rate` | 滚动成功率 |
-| `curriculum/rolling_stage1_train_score` | Stage 1 训练口径滚动百分制分数 |
-| `curriculum/rolling_stage1_eval_score` | Stage 1 评估口径滚动百分制分数 |
+| `curriculum/rolling_train_score` | 当前课程训练口径滚动百分制分数 |
+| `curriculum/actual_mix_ratio` | 穿插训练实际混合比例（未开启时为 0.0） |
 
 环境 `info` 中还会提供轻量扰动调试指标，便于训练时确认实际速度来源：
 
 | 指标 | 含义 |
 | --- | --- |
 | `reward/velocity_toward` | 悬停阶段实际速度方向朝向目标点的奖惩 |
+| `reward/pos_xy` | Stage 2 门控后的水平位置奖励分项 |
+| `reward/pos_z` | Stage 2 门控后的高度位置奖励分项 |
+| `metric/xy_gate_for_z` | Stage 2 高度奖励的水平距离门控 |
+| `metric/z_gate_for_xy` | Stage 2 水平奖励的垂直距离门控 |
 | `metric/stability_coeff` | 悬停稳定速度惩罚系数，范围 `[0, 1]` |
 | `metric/velocity_toward_cos` | 实际速度方向与目标方向夹角余弦 |
 | `metric/velocity_toward_weight` | 速度朝向奖励的距离权重和速度权重乘积 |
@@ -577,10 +619,12 @@ CSV 输出：
 
 ```text
 data/csv/{exp_name}/
-├── episode_log.csv     每回合：timestep, stage, reward, length, success，以及策略声明的 episode 指标
-├── reward_log_stageN.csv 每步核心奖励分项和距离/速度指标
-└── training_log.csv    定期记录 actor_loss, critic_loss, ent_coef, lr, fps
+├── episode_log.csv        每回合：timestep, stage, reward, length, success, train_score
+├── reward_log_stageN.csv  每步奖励分项和距离/速度指标（按课程分文件，N 为课程编号）
+└── training_log.csv       定期记录 actor_loss, critic_loss, ent_coef, lr, fps
 ```
+
+`episode_log.csv` 中 `train_score` 统一命名无课程前缀，按 `stage` 列区分课程。`reward_log_stage1.csv` 和 `reward_log_stage2.csv` 按课程分别记录奖励分项；Stage 2 额外包含速度匹配、相对速度、平台速度、位置门控和朝向目标 shaping 诊断列。
 
 MATLAB 读取示例：
 
@@ -740,9 +784,9 @@ data/csv/smoke_obs34/
 
 `--total_steps` 现在表示每个所选课程阶段的训练步数。未传入 `--max_stage` 时只训练 `--stage` 指定的当前课程。
 
-### 19.4 Stage 2/3/4 奖励待实现
+### 19.4 Stage 3/4 奖励待实现
 
-当前仅 Stage 1 保持可训练。Stage 2/3/4 已注册但奖励函数会显式抛出 `NotImplementedError`，不能直接用于正式训练；后续应在对应课程方案阶段单独设计奖励、指标和评估方式。
+Stage 1 和 Stage 2 均可训练。Stage 3/4 已注册但奖励函数抛出 `NotImplementedError`，待后续设计。
 
 ### 19.5 多阶段 CSV callback 句柄复用
 
@@ -887,3 +931,44 @@ conda run --no-capture-output -n drone_rl python scripts\export_model.py --model
   - PyTorch 2.7.1+cu128、CUDA 12.8、RTX 4070 Ti SUPER GPU 支持验证通过
 - 同步 `requirements.txt` 到 `drone_rl` 中已验证的核心包版本范围。
 - 更新第 2 节环境验证记录，详细列出功能验证清单和性能基准。
+
+2026-05-05：
+
+- **课程结构调整**：Stage 2 从 Land-Static 替换为 Hover-Moving（移动平台上方悬停），完整实现奖励函数（8 组件，核心新增速度匹配奖励 `r_vel_match`）、成功判定和指标。
+- **文件整理**：`stage3_hover_moving.py` → `stage3.py`、`stage4_land_moving.py` → `stage4.py`，类名改为 `Stage3Strategy`/`Stage4Strategy`，去除未确定课程的功能描述。删除 `stage2_land_static.py`。
+- **统一训练输出**：
+  - `episode_log.csv` 精简为 6 列（`timestep, stage, reward, length, success, train_score`），指标名去课程前缀。
+  - 删除 `registered_episode_metric_keys()` 函数和 `base_env.py` 中的补齐逻辑。
+  - `episode_info_keywords()` 固定为 `("success", "episode_stage", "train_score")`。
+- **穿插训练**（仅 Stage 2+）：新增 `--mix_ratio` CLI 参数，每回合以指定概率使用前一课程策略。修复 4 个 Bug（`_nominal_stage` 缺失、初始策略未缓存、直接启动无前置缓存、TensorBoard 指标被稀释）。
+- `scripts/test_env.py`：全部 22 项测试通过（单环境 ~6,200 FPS）。
+- 更新 README 文档反映上述变更。
+
+2026-05-06：
+
+- **删除 SinusoidalMotion**：被 LissajousMotion 覆盖（频率池含 1.0:0.7），Stage 3/4 同步替换。
+- **运动策略范围重设计**：Waypoint 航点范围 [-50,50]²（原 [-30,30]²），边距 ≥10m（原 1m）；Patrol 目标距离 15-40m（原 2-5m）；Lissajous 每 episode 随机幅值 15-35m×10-30m（原 2m×1m）。
+- **OOB 改为绝对地图边界**（Stage 2）：|x|,|y| ≤ 100m，z ≥ 0。Strategy 基类新增 `get_map_bounds()` hook。
+- **无人机出生位置改为外环**（Stage 2）：[-80,80]² 但排除 [-50,50]² 平台活动区。Strategy 基类新增 `get_spawn_position()` hook。
+- **速度系统修正**：MotionStrategy.step() 返回完整速度 vel_xy，MovingPlatform 不再缩放。时间参数化策略（Lissajous）使用分析导数；路径累积策略（Patrol/Waypoint）使用 speed × direction。
+- **卡尔曼滤波器改为纯位置观测**：MEAS_DIM 4→2，H=[I₂ 0₂]，速度由匀速模型从位置差/dt 推算。
+- **平台速度范围调整**：SpeedController 输出 0.3-4.5 m/s（原 0.2-1.6），无人机 8-20 m/s 始终大于平台。
+- **奖励参数优化**：r_pos σ 放宽（0.25→0.30, 0.20→0.22），vel_gate 过渡带宽 1.5m（原 0.5m），r_vel_match 与 r_vel 共用 vel_gate。
+- `scripts/test_env.py`：全部 22 项测试通过（单环境 ~6,000 FPS）。
+- 更新 README 文档反映上述变更。
+
+2026-05-06（Stage 2 平台运动与速度观测修复）：
+
+- **Stage 2 统一速度控制**：Lissajous/Patrol/Waypoint 均消费 `SpeedController` 输出的标量速度，按路径弧长推进；位置差分速度和报告速度受控在 5m/s 内。
+- **异常位移修复**：`MovingPlatform.reset()` 同步到 motion 初始位置；Patrol/Waypoint 换段保留 overshoot，Lissajous 使用闭合曲线连续循环。
+- **速度观测简化**：Stage 2 不再使用 KF 从位置估计平台速度，改为真实平台速度 + 默认 2 step 延迟 + `Uniform(0.98, 1.02)` 比例误差。KF 文件保留给未来真实传感器版本。
+- **测试覆盖**：`scripts/test_env.py` 增加 Stage 2 平台运动连续性和速度观测测试。
+
+2026-05-06（eval 与轨迹可视化修复）：
+
+- **eval 双分数**：`episode_metrics` 新增 `eval_score`，评估打印同时显示 `Train` 和 `Eval` 分数，消除口径不一致。
+- **base_env 暴露滤波状态**：新增 `_platform_state_filtered` 属性，供轨迹记录和外部访问。
+- **轨迹 CSV 新增滤波列**：`platform_fx/fy/fz`、`platform_fvx/fvy/fvz`、`target_fx/fy/fz`，记录模型实际观测的 KF 滤波状态。
+- **实时/离线轨迹图增加滤波线**：3D 图中以虚线显示滤波后的平台位置和目标点，速度图中显示滤波后的平台速度。Stage 1 滤波线与真值重合，Stage 2 可见 KF 估计偏差。
+- `scripts/test_env.py`：全部 22 项测试通过。
+- 更新 README 文档。

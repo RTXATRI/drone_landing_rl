@@ -6,16 +6,46 @@
 
 - `curriculum_manager.py`：记录每个课程的 episode 数、成功数、平均奖励、平均长度和策略指标；维护滚动统计窗口。阶段切换由 `Trainer` 在阶段预算结束后询问用户手动决定。
 - `strategies/`：课程策略注册表和内置策略实现。新增课程时优先新增策略类并注册。
+- `strategies/kalman_filter.py`：平台运动状态的 4D 卡尔曼滤波器。当前 Stage 2 Python 预训练不再使用它估计速度，文件保留给未来真实传感器版本。
+
+## 已注册课程
+
+| 课程 | 文件 | 类名 | 描述 | 状态 |
+| --- | --- | --- | --- | --- |
+| Stage 1 | `stage1_hover_static.py` | `Stage1HoverStaticStrategy` | 静止平台上悬停 | ✅ 可训练 |
+| Stage 2 | `stage2_hover_moving.py` | `Stage2HoverMovingStrategy` | 移动平台上悬停（3 种速度受控运动模式随机池：Lissajous/Patrol/Waypoint，平台真实速度带轻量延迟和误差） | ✅ 可训练 |
+| Stage 3 | `stage3.py` | `Stage3Strategy` | 待定 | ❌ 奖励未实现 |
+| Stage 4 | `stage4.py` | `Stage4Strategy` | 待定 | ❌ 奖励未实现 |
 
 ## 课程策略
 
 策略类负责决定：
 
 - episode 场景如何配置。
-- 平台运动模式如何设置。
-- 目标点如何计算。
+- 平台运动模式如何设置（通过 `MovingPlatform.set_motion_strategy()`）。
+- 目标点如何计算（悬停课程继承 `HoverStrategyMixin`，降落课程继承 `LandingStrategyMixin`）。
 - 奖励和终端奖励如何计算。
 - 成功、失败和评估指标如何定义。
+- CSV 日志列定义。
+
+策略指标统一命名为无课程前缀的通用名（如 `train_score`、`eval_score`），由 `stage` 列区分课程。`reward_log_stageN.csv` 按课程分文件存储，列名也无前缀。
+
+## Stage 2 平台观测
+
+Stage 2 作为 Python 预训练，平台速度直接来自仿真真实速度，不再通过位置变化和 KF 推算。策略会加入轻量观测模拟：默认 2 step 延迟，并对 XY 速度乘以 `Uniform(0.98, 1.02)` 的 episode 级比例误差。平台位置和 yaw 仍保留小噪声与检测质量丢帧标记。
+
+## 穿插训练（Stage 2+）
+
+训练后续课程时，可通过 `env.enable_mix_training(ratio)` 启用穿插训练。每回合以 `ratio` 概率随机选择前一课程策略，其余使用当前课程策略。策略实例通过 `env._strategies` 字典按 `stage_id` 缓存，`env._nominal_stage` 记录真实训练阶段不受混合影响。
+
+`CurriculumCallback` 自动过滤混合回合（`episode_stage != current_stage` 时跳过），避免滚动指标被稀释。TensorBoard 中 `curriculum/actual_mix_ratio` 显示实际混合比例。
+
+## 新增课程指南
+
+1. 新建策略文件（如 `stage3.py`），继承 `HoverStrategyMixin` 或 `LandingStrategyMixin` + `CurriculumStrategy`。
+2. 实现 `stage_id()`、`setup_scene()`、`compute_reward()`、`terminal_bonus()` 等方法。
+3. 在 `strategies/__init__.py` 的 `STRATEGY_MAP` 中注册。
+4. 策略中的 episode 指标使用通用命名（如 `("train_score",)`），不要加课程前缀。
 
 ## 阶段切换逻辑
 

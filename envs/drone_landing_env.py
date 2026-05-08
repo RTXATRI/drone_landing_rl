@@ -135,15 +135,19 @@ class DroneLandingEnv(BaseDroneLandingEnv):
         # 让当前课程策略配置场景级状态。
         self.strategy.setup_scene(self, rng)
 
-        # 围绕平台的圆柱随机出生点
-        radius = rng.uniform(cfg.init_spawn_radius_min, cfg.init_spawn_radius_max)
-        angle  = rng.uniform(0, 2 * np.pi)
-        height = rng.uniform(cfg.init_spawn_height_min, cfg.init_spawn_height_max)
-        drone_pos = np.array([
-            radius * np.cos(angle),
-            radius * np.sin(angle),
-            height,
-        ])
+        # 无人机出生位置（策略可覆盖）
+        spawn_pos = self.strategy.get_spawn_position(np.zeros(3, dtype=np.float64), rng)
+        if spawn_pos is not None:
+            drone_pos = np.asarray(spawn_pos, dtype=np.float64).copy()
+        else:
+            radius = rng.uniform(cfg.init_spawn_radius_min, cfg.init_spawn_radius_max)
+            angle  = rng.uniform(0, 2 * np.pi)
+            height = rng.uniform(cfg.init_spawn_height_min, cfg.init_spawn_height_max)
+            drone_pos = np.array([
+                radius * np.cos(angle),
+                radius * np.sin(angle),
+                height,
+            ])
 
         # 随机初始 yaw
         init_euler = np.array([0.0, 0.0, rng.uniform(-np.pi, np.pi)])

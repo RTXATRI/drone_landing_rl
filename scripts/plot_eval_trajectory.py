@@ -71,6 +71,10 @@ def _plot_episode(df: pd.DataFrame, out_dir: str, episode_name: str) -> None:
     ax3d.plot(df["drone_x"], df["drone_y"], df["drone_z"], label="drone", color="tab:blue")
     ax3d.plot(df["platform_x"], df["platform_y"], df["platform_z"], label="platform", color="tab:red", alpha=0.8)
     ax3d.plot(df["target_x"], df["target_y"], df["target_z"], label="target", color="tab:green", ls="--", alpha=0.8)
+    has_filtered = "platform_fx" in df.columns
+    if has_filtered:
+        ax3d.plot(df["platform_fx"], df["platform_fy"], df["platform_fz"], color="tab:red", ls=":", alpha=0.5, label="plat(f)")
+        ax3d.plot(df["target_fx"], df["target_fy"], df["target_fz"], color="tab:green", ls=":", alpha=0.5, label="tgt(f)")
 
     ax3d.scatter(df["drone_x"].iloc[0], df["drone_y"].iloc[0], df["drone_z"].iloc[0],
                  color="tab:blue", marker="o", s=25, label="start")
