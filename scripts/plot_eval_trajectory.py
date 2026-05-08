@@ -8,7 +8,7 @@
   - 跨 episode 的合并图
 
 用法：
-  python scripts/plot_eval_trajectory.py --stage_dir data/eval_traj/<run>/stage_1
+  python scripts/plot_eval_trajectory.py --stage_dir output/data/eval_traj/<run>/stage_1
 """
 
 from __future__ import annotations

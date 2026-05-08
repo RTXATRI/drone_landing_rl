@@ -12,7 +12,7 @@
 clear; clc; close all;
 
 %% 配置
-STAGE_DIR = 'data/eval_traj/demo_run/stage_1';  % <- 修改这里
+STAGE_DIR = 'output/data/eval_traj/demo_run/stage_1';  % <- 修改这里
 PLOT_PER_EPISODE = true;
 PLOT_COMBINED    = true;
 SHOW_FIG         = true;

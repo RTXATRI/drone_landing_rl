@@ -12,13 +12,13 @@
 
 用法：
     # 导出所有格式
-    python scripts/export_model.py --model models/drone_landing/model_final
+    python scripts/export_model.py --model output/models/drone_landing/model_final
 
     # 只导出 TorchScript
-    python scripts/export_model.py --model models/drone_landing/model_final --format torchscript
+    python scripts/export_model.py --model output/models/drone_landing/model_final --format torchscript
 
     # 对比 SB3 输出，验证导出模型
-    python scripts/export_model.py --model models/drone_landing/model_final --verify
+    python scripts/export_model.py --model output/models/drone_landing/model_final --verify
 """
 
 import argparse

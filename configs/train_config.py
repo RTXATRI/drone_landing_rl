@@ -51,7 +51,7 @@ class CurriculumConfig:
     # 已注册课程的预算步数（可通过 CLI --total_steps 覆盖）
     stage_timesteps: List[int] = field(default_factory=lambda: [
         60_000_000,
-        60_000_000,
+        30_000_000,
         30_000_000,
         30_000_000,
     ])
@@ -70,12 +70,14 @@ class TrainConfig:
     device: str = "cuda"   # "cuda" | "cpu"
 
     # ── 路径 ─────────────────────────────────────────────────────────────────
-    log_dir: str = "./logs"
-    model_dir: str = "./models"
-    csv_dir: str = "./data/csv"
+    log_dir: str = "./output/logs"
+    model_dir: str = "./output/models"
+    csv_dir: str = "./output/data/csv"
 
-    # ── Checkpoint 保存 ──────────────────────────────────────────────────────
-    save_freq: int = 50_000  # 两次 checkpoint 保存之间的步数
+    # ── 输出频率 ─────────────────────────────────────────────────────────────
+    sb3_log_interval_episodes: int = 200          # SB3 主表格输出间隔（全局 episode）
+    curriculum_status_interval_episodes: int = 200  # 课程短行输出间隔（当前阶段 episode）
+    save_freq: int = 4_800_000                    # checkpoint 保存间隔（真实 timesteps）
 
     # ── 可复现性 ─────────────────────────────────────────────────────────────
     seed: int = 42

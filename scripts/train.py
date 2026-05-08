@@ -8,7 +8,7 @@
     python scripts/train.py
 
     # 从指定课程开始，并恢复某个 checkpoint
-    python scripts/train.py --stage 3 --resume models/drone_landing/ckpt_0000500000
+    python scripts/train.py --stage 3 --resume output/models/drone_landing/ckpt_0000500000
 
     # 允许在课程之间手动继续
     python scripts/train.py --stage 1 --max_stage 4

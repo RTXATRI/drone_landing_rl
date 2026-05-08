@@ -51,7 +51,7 @@ def parse_args():
     p.add_argument("--n_envs",      type=int, default=8)
     p.add_argument("--stage",       type=int, default=1)
     p.add_argument("--device",      type=str, default="cuda")
-    p.add_argument("--log_dir",     type=str, default="./logs/sweep")
+    p.add_argument("--log_dir",     type=str, default="./output/logs/sweep")
     p.add_argument("--parallel",    type=int, default=1,
                    help="Number of runs to launch in parallel (use with care — GPU memory)")
     return p.parse_args()

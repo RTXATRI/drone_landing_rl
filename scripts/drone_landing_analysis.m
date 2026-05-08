@@ -14,7 +14,7 @@
 clear; clc; close all;
 
 %% ── 配置 ─────────────────────────────────────────────────────────────────
-CSV_DIR  = 'data/csv/drone_landing';   % ← 修改该路径
+CSV_DIR  = 'output/data/csv/drone_landing';   % ← 修改该路径
 OUT_DIR  = fullfile(CSV_DIR, 'figures_matlab');
 MA_WIN   = 100;           % 移动平均窗口（episode）
 SR_WIN   = 50;            % 成功率移动平均窗口

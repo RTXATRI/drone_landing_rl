@@ -7,7 +7,7 @@
 
 用法：
     python scripts/record_video.py \
-        --model models/drone_landing/model_final \
+        --model output/models/drone_landing/model_final \
         --stage 4 \
         --episodes 3 \
         --out eval_stage4.mp4

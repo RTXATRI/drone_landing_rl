@@ -15,9 +15,9 @@
 
 训练默认输出到：
 
-- `logs/{exp_name}/`
-- `models/{exp_name}/`
-- `data/csv/{exp_name}/`
+- `output/logs/{exp_name}/`
+- `output/models/{exp_name}/`
+- `output/data/csv/{exp_name}/`
 
 这些目录属于运行产物，不是核心源码。
 

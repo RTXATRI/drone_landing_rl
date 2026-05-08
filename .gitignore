@@ -21,6 +21,7 @@ env/
 !.vscode/extensions.json
 
 # Training outputs
+output/
 logs/*
 !logs/.gitkeep
 models/*

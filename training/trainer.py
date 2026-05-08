@@ -147,6 +147,7 @@ class Trainer:
                 model.learn(
                     total_timesteps = stage_steps,
                     callback = callbacks,
+                    log_interval = self.cfg.sb3_log_interval_episodes,
                     tb_log_name = self.cfg.exp_name,
                     reset_num_timesteps = reset_num_timesteps,
                     progress_bar = True,
@@ -234,14 +235,16 @@ class Trainer:
         return model
 
     def _build_callbacks(self, curriculum: CurriculumManager):
+        n_envs = max(1, int(self.cfg.n_envs))
         curriculum_cb = CurriculumCallback(
             manager=curriculum,
-            check_freq=self.cfg.curriculum.eval_freq,
+            check_freq=self.cfg.curriculum.eval_freq * n_envs,
+            status_interval_episodes=self.cfg.curriculum_status_interval_episodes,
             verbose=1,
         )
         csv_cb = CSVLoggingCallback(
             csv_dir=os.path.join(self.cfg.csv_dir, self.cfg.exp_name),
-            flush_freq=2_000,
+            flush_freq=2_000 * n_envs,
             env_config=self.env_cfg,
             verbose=0,
         )

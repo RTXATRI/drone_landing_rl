@@ -5,7 +5,7 @@
 ## 文件职责
 
 - `env_config.py`：环境配置，包括无人机速度限制、轻量扰动、平台尺寸、episode 生命周期、观测归一化/裁剪参数。
-- `train_config.py`：训练配置，包括 SAC 超参数、并行环境数、日志/模型/CSV 路径、checkpoint 频率、手动课程阶段预算和统计窗口。
+- `train_config.py`：训练配置，包括 SAC 超参数、并行环境数、`output/` 下的日志/模型/CSV 路径、控制台输出频率、checkpoint 频率、手动课程阶段预算和统计窗口。
 
 ## 调参入口
 
@@ -20,7 +20,7 @@
 
 - SAC 学习率、batch size、buffer size：`SACConfig`
 - 成功率窗口和阶段预算：`CurriculumConfig`
-- 实验名、日志目录、模型目录：`TrainConfig`
+- 实验名、输出目录、SB3 主表格/课程短行/checkpoint 频率：`TrainConfig`
 
 ## 迁移提示
 

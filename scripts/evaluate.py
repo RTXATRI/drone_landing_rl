@@ -8,20 +8,20 @@
 
 示例：
     # 评估指定课程的最终模型
-    python scripts/evaluate.py --model models/drone_landing/model_final --stage 4
+    python scripts/evaluate.py --model output/models/drone_landing/model_final --stage 4
 
     # 使用 GUI 渲染
-    python scripts/evaluate.py --model models/drone_landing/model_final --stage 4 --render
+    python scripts/evaluate.py --model output/models/drone_landing/model_final --stage 4 --render
 
     # 依次评估全部四个阶段
-    python scripts/evaluate.py --model models/drone_landing/model_final --all_stages
+    python scripts/evaluate.py --model output/models/drone_landing/model_final --all_stages
 
     # 使用固定条件评估某个课程
-    python scripts/evaluate.py --model models/stage1_hover/model_final --stage 1 \
+    python scripts/evaluate.py --model output/models/stage1_hover/model_final --stage 1 \
         --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
 
     # 将轨迹数据保存到 CSV
-    python scripts/evaluate.py --model models/drone_landing/model_final --save_traj
+    python scripts/evaluate.py --model output/models/drone_landing/model_final --save_traj
 """
 
 import argparse
@@ -57,7 +57,7 @@ TRAJ_PLOT_DEFAULT = False
 TRAJ_PLOT_REALTIME_DEFAULT = False
 TRAJ_PLOT_PER_EPISODE_DEFAULT = True
 TRAJ_PLOT_COMBINED_DEFAULT = True
-TRAJ_OUT_DIR_DEFAULT = "data/eval_traj"
+TRAJ_OUT_DIR_DEFAULT = "output/data/eval_traj"
 TRAJ_STRIDE_DEFAULT = 1
 TRAJ_REALTIME_REFRESH_DEFAULT = 10
 

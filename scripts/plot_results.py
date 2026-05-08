@@ -14,9 +14,9 @@
   6. 各阶段到目标距离分布（violin plot）
 
 用法：
-    python scripts/plot_results.py --csv_dir data/csv/drone_landing
-    python scripts/plot_results.py --csv_dir data/csv/drone_landing --show
-    python scripts/plot_results.py --csv_dir data/csv/exp1 --out_dir figs/exp1
+    python scripts/plot_results.py --csv_dir output/data/csv/drone_landing
+    python scripts/plot_results.py --csv_dir output/data/csv/drone_landing --show
+    python scripts/plot_results.py --csv_dir output/data/csv/exp1 --out_dir figs/exp1
 """
 
 from __future__ import annotations

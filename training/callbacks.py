@@ -77,6 +77,23 @@ def _episode_stage(info: dict, episode_info: dict) -> int:
     return int(info.get("episode_stage", info.get("stage", 0)))
 
 
+def _next_interval_step(current_step: int, interval: int) -> int:
+    """Return the next positive interval boundary strictly after current_step."""
+    interval = max(1, int(interval))
+    current_step = max(0, int(current_step))
+    return ((current_step // interval) + 1) * interval
+
+
+def _format_step_compact(step: int) -> str:
+    """Format large timesteps compactly for status lines."""
+    step = int(step)
+    if abs(step) >= 1_000_000:
+        return f"{step / 1_000_000:.2f}M"
+    if abs(step) >= 1_000:
+        return f"{step / 1_000:.1f}k"
+    return str(step)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. 课程学习回调
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,16 +104,27 @@ class CurriculumCallback(BaseCallback):
 
     每一步：
       - 记录 VecEnv 报告的 episode 结果
-      - 每 `check_freq` 步：将阶段指标写入 TensorBoard/控制台
+      - 每 `check_freq` 步：将阶段指标写入 TensorBoard
+      - 每 `status_interval_episodes` 个当前阶段 episode：输出课程状态短行
     """
 
     def __init__(self, manager: CurriculumManager, check_freq: int = 1_000,
+                 status_interval_episodes: int = 200,
                  verbose: int = 1):
         super().__init__(verbose)
         self.manager = manager
-        self.check_freq = check_freq
+        self.check_freq = max(1, int(check_freq))
+        self.status_interval_episodes = max(1, int(status_interval_episodes))
         self._mixed_count = 0
         self._total_count = 0
+        self._next_check_step = self.check_freq
+        self._last_status_stage = None
+        self._next_status_eps = self.status_interval_episodes
+
+    def _on_training_start(self) -> None:
+        self._next_check_step = _next_interval_step(self.num_timesteps, self.check_freq)
+        self._last_status_stage = None
+        self._next_status_eps = self.status_interval_episodes
 
     def _on_step(self) -> bool:
         step_delta = int(getattr(self.training_env, "num_envs", 1))
@@ -124,8 +152,12 @@ class CurriculumCallback(BaseCallback):
                 )
 
         # 周期性记录手动课程指标
-        if self.n_calls % self.check_freq == 0:
+        if self.num_timesteps >= self._next_check_step:
             self._log_to_tensorboard()
+            while self._next_check_step <= self.num_timesteps:
+                self._next_check_step += self.check_freq
+
+        self._maybe_print_status()
 
         return True
 
@@ -154,26 +186,42 @@ class CurriculumCallback(BaseCallback):
             )
         self._mixed_count = 0
         self._total_count = 0
-        self.logger.dump(self.num_timesteps)
 
-        if self.verbose >= 1:
-            sr_window = self.manager.cfg.window_size
-            summary_fields = [f"SuccessRate{sr_window}={sr:.1%}"]
-            if "train_score" in metric_keys:
-                summary_fields.append(
-                    f"AvgTrainScore{sr_window}="
-                    f"{self.manager.rolling_metric('train_score'):.1f}"
-                )
-            summary_fields.extend([
-                f"AvgLen{sr_window}={self.manager.rolling_avg_length():.0f}",
-                f"AvgReward{sr_window}={self.manager.rolling_avg_reward():+.1f}",
-            ])
-            _write_progress_line(
-                f"[{self.num_timesteps:>10,}] "
-                f"Stage {st} {STAGE_SHORT_LABELS[st]} | "
-                f"Eps={eps} | "
-                + " | ".join(summary_fields)
+    def _maybe_print_status(self) -> None:
+        if self.verbose < 1:
+            return
+
+        st = self.manager.current_stage
+        eps = self.manager.stage_stats[st].episodes
+        if self._last_status_stage != st:
+            self._last_status_stage = st
+            self._next_status_eps = (
+                (eps // self.status_interval_episodes) + 1
+            ) * self.status_interval_episodes
+
+        if eps < self._next_status_eps:
+            return
+
+        sr_window = self.manager.cfg.window_size
+        metric_keys = self.manager.current_episode_metric_keys()
+        summary_fields = [f"SR{sr_window}={self.manager.rolling_success_rate():.1%}"]
+        if "train_score" in metric_keys:
+            summary_fields.append(
+                f"score{sr_window}="
+                f"{self.manager.rolling_metric('train_score'):.1f}"
             )
+        summary_fields.extend([
+            f"len{sr_window}={self.manager.rolling_avg_length():.0f}",
+            f"rew{sr_window}={self.manager.rolling_avg_reward():+.1f}",
+        ])
+        _write_progress_line(
+            f"[{_format_step_compact(self.num_timesteps)}] "
+            f"S{st} {STAGE_SHORT_LABELS[st]} | "
+            f"eps={eps} | "
+            + " | ".join(summary_fields)
+        )
+        while self._next_status_eps <= eps:
+            self._next_status_eps += self.status_interval_episodes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +251,7 @@ class CSVLoggingCallback(BaseCallback):
                  env_config: EnvConfig = None, verbose: int = 0):
         super().__init__(verbose)
         self.csv_dir    = csv_dir
-        self.flush_freq = flush_freq
+        self.flush_freq = max(1, int(flush_freq))
         self.env_config = env_config or EnvConfig()
 
         os.makedirs(csv_dir, exist_ok=True)
@@ -215,6 +263,7 @@ class CSVLoggingCallback(BaseCallback):
         self._reward_strategies: Dict[int, object] = {}
         self._episode_cols = [*self.BASE_EPISODE_COLS, "train_score"]
         self._has_written_header = False
+        self._next_flush_step = self.flush_freq
 
     def _on_training_start(self) -> None:
         """打开 CSV 文件并写入表头。"""
@@ -229,6 +278,7 @@ class CSVLoggingCallback(BaseCallback):
         self._episode_fh, self._episode_w = _open("episode_log.csv",  self._episode_cols)
         self._train_fh,   self._train_w   = _open("training_log.csv", self.TRAIN_COLS)
         self._has_written_header = True
+        self._next_flush_step = _next_interval_step(self.num_timesteps, self.flush_freq)
 
     def _strategy_for_stage(self, stage: int):
         stage = int(stage)
@@ -299,7 +349,7 @@ class CSVLoggingCallback(BaseCallback):
                 writer.writerow(row)
 
         # 训练指标行（周期性 flush）
-        if self.n_calls % self.flush_freq == 0 and self._train_w:
+        if self.num_timesteps >= self._next_flush_step and self._train_w:
             lv = self.model.logger.name_to_value
             stage = 1
             try:
@@ -318,6 +368,8 @@ class CSVLoggingCallback(BaseCallback):
             self._train_fh.flush()
             for fh in self._reward_fhs.values():
                 fh.flush()
+            while self._next_flush_step <= self.num_timesteps:
+                self._next_flush_step += self.flush_freq
 
         return True
 
@@ -325,6 +377,11 @@ class CSVLoggingCallback(BaseCallback):
         for fh in (self._episode_fh, self._train_fh, *self._reward_fhs.values()):
             if fh:
                 fh.close()
+        self._episode_fh = self._train_fh = None
+        self._episode_w = self._train_w = None
+        self._reward_fhs.clear()
+        self._reward_ws.clear()
+        self._reward_cols.clear()
         logger.info(f"CSV logs saved to: {self.csv_dir}")
 
 
@@ -337,15 +394,21 @@ class CheckpointCallback(BaseCallback):
 
     def __init__(self, save_freq: int, save_dir: str, verbose: int = 1):
         super().__init__(verbose)
-        self.save_freq = save_freq
+        self.save_freq = max(1, int(save_freq))
         self.save_dir  = save_dir
+        self._next_save_step = self.save_freq
         os.makedirs(save_dir, exist_ok=True)
 
+    def _on_training_start(self) -> None:
+        self._next_save_step = _next_interval_step(self.num_timesteps, self.save_freq)
+
     def _on_step(self) -> bool:
-        if self.n_calls % self.save_freq == 0:
+        if self.num_timesteps >= self._next_save_step:
             ts   = self.num_timesteps
             path = os.path.join(self.save_dir, f"ckpt_{ts:010d}")
             self.model.save(path)
             if self.verbose >= 1:
                 _write_progress_line(f"Checkpoint saved -> {path}.zip")
+            while self._next_save_step <= self.num_timesteps:
+                self._next_save_step += self.save_freq
         return True

@@ -1,6 +1,6 @@
 # Drone Landing RL 工程总览
 
-此项目还在开发中，目前未完成，最后更新时间：2026-05-05
+此项目还在开发中，目前未完成，最后更新时间：2026-05-08
 
 本文件是工程根目录的总入口说明文档，目标是让开发者、研究者或 AI 助手快速理解这个工程的用途、架构、运行方式、关键参数和当前风险。各主要源码目录内也新增了中文 `README.md`，用于解释该目录的代码职责和后续 ROS/Gazebo 迁移边界。
 
@@ -152,9 +152,10 @@ drone_landing_rl/
 │   ├── misc.py                    通用辅助工具
 │   └── README.md                  工具目录说明
 │
-├── logs/                          TensorBoard 和运行日志
-├── models/                        模型 checkpoint 和 final 模型
-├── data/csv/                      训练/评估 CSV 数据
+├── output/                        训练、评估和导出产物（默认被 git 忽略）
+│   ├── logs/                      TensorBoard 和运行日志
+│   ├── models/                    模型 checkpoint 和 final 模型
+│   └── data/                      CSV、评估轨迹和分析数据
 ├── requirements.txt               Python 依赖
 └── README.md                      本文档
 ```
@@ -381,7 +382,7 @@ wind_velocity = base_wind_velocity + gust_velocity
 | Stage 3 | `Stage3Strategy` | 移动平台上悬停（Lissajous 运动） | ❌ 奖励未实现 |
 | Stage 4 | `Stage4Strategy` | 移动平台上降落（Lissajous 运动） | ❌ 奖励未实现 |
 
-Stage 2 每 episode 从 3 种运动模式中随机选择：Lissajous（闭合曲线，幅值 15-35m）、Patrol（原点↔目标 15-40m 往返）、Waypoint（多边形航点 ∈[-50,50]²）。三种运动都由统一 `SpeedController` 控制速度。平台速度观测直接使用仿真真实速度，并加入默认 2 step 延迟和 `Uniform(0.98, 1.02)` 的小比例误差；KF 文件仅作为未来真实传感器版本备用。奖励含 8 组件：位置接近（XY/Z 高斯 σ 放宽至 4.0/2.0，并互相门控：水平 10m 外不给高度奖励、垂直 5m 外不给水平奖励）、相对速度惩罚（XY vel_gate 外沿 3m，Z 外沿 1m）、速度方向对齐（与 r_vel 共用 vel_gate）、朝向目标 shaping（距离尺度 25m，权重 0.6）等。核心差异 vs Stage 1：速度判据从绝对速度改为相对平台速度，新增速度匹配奖励。
+Stage 2 每 episode 从 3 种运动模式中随机选择：Lissajous、Patrol、Waypoint。三种运动都由统一 `SpeedController` 控制速度，平台速度观测使用仿真真实速度，并加入默认 2 step 延迟和 `Uniform(0.98, 1.02)` 的小比例误差；KF 文件保留给未来真实传感器版本备用。当前 Stage 2 奖励由三层位置奖励、近距速度匹配惩罚、yaw/yaw_rate 惩罚和动作平滑/幅值惩罚组成；核心差异 vs Stage 1 是速度判据从无人机绝对速度改为相对平台速度。
 
 ### 11.2 穿插训练（仅 Stage 2+ 生效）
 
@@ -410,14 +411,14 @@ conda run --no-capture-output -n drone_rl python scripts\train.py --stage 2 --mi
 | --- | --- | --- |
 | `advance_threshold` | `0.80` | 旧自动晋级阈值，当前仅保留兼容 |
 | `window_size` | `30` | 滚动成功率窗口 |
-| `eval_freq` | `8000` | 周期性日志和 TensorBoard 写入频率 |
+| `eval_freq` | `8000` | 课程 TensorBoard 指标检查基础频率；训练器会按 `n_envs` 换算为实际 timesteps 间隔 |
 | `min_steps_per_stage` | `60000` | 旧自动晋级参数，当前不参与阶段切换 |
-| `max_stage` | 未传入时等于 `--stage` | 本次训练允许手动推进到的最高课程阶段 |
+| `max_stage` | `4` | 本次训练允许手动推进到的最高课程阶段 |
 
-注意：直接运行只训练 `--stage` 指定的单个课程。若希望训练多个课程，需要显式传入 `--max_stage`，并在每个阶段结束后手动输入 `Y/N`：
+注意：当前 CLI 默认 `--max_stage 4`。直接运行会从 Stage 1 开始，Stage 1 预算结束后询问是否继续后续课程；非交互式运行默认选择 `N` 并保存退出。若只想训练单个课程，请显式令 `--max_stage` 等于 `--stage`：
 
 ```powershell
-conda run --no-capture-output -n drone_rl python scripts\train.py --stage 1 --max_stage 4
+conda run --no-capture-output -n drone_rl python scripts\train.py --stage 1 --max_stage 1
 ```
 
 ## 12. 训练系统
@@ -433,37 +434,40 @@ conda run --no-capture-output -n drone_rl python scripts\train.py
 | 参数 | 默认值 | 示例 | 说明 |
 | --- | --- | --- | --- |
 | `--stage` | `1` | `--stage 1` | 起始课程阶段，取值 `1-4` |
-| `--max_stage` | 未传入时等于 `--stage` | `--max_stage 4` | 本次训练允许手动推进到的最高课程阶段；大于 `--stage` 时，每个阶段结束后询问 `Y/N` |
-| `--resume` | `None` | `--resume models\drone_landing\ckpt_0001000000` | 从 checkpoint 恢复训练，路径不带 `.zip` |
-| `--n_envs` | `16` | `--n_envs 8` | 并行采样环境数 |
+| `--max_stage` | `4` | `--max_stage 4` | 本次训练允许手动推进到的最高课程阶段；大于 `--stage` 时，每个阶段结束后询问 `Y/N` |
+| `--resume` | `None` | `--resume output\models\drone_landing\ckpt_0001000000` | 从 checkpoint 恢复训练，路径不带 `.zip` |
+| `--n_envs` | `96` | `--n_envs 8` | 并行采样环境数 |
 | `--device` | `cuda` | `--device cpu` | 训练设备，可选 `cuda` 或 `cpu`；如果 CUDA 不可用会回退到 CPU |
-| `--exp_name` | `drone_landing` | `--exp_name stage1_hover` | 实验名，用于 `logs/`、`models/`、`data/csv/` 子目录 |
+| `--exp_name` | `drone_landing` | `--exp_name stage1_hover` | 实验名，用于 `output/logs/`、`output/models/`、`output/data/csv/` 子目录 |
 | `--seed` | `42` | `--seed 0` | 训练随机种子 |
 | `--total_steps` | `None` | `--total_steps 20000` | 覆盖每个所选课程阶段的训练步数预算；未传入时使用 `configs/train_config.py` 中的 `stage_timesteps` |
-| `--batch_size` | `512` | `--batch_size 256` | SAC replay buffer 采样 batch size |
+| `--batch_size` | `2048` | `--batch_size 1024` | SAC replay buffer 采样 batch size |
 | `--lr` | `3e-4` | `--lr 0.0003` | SAC 学习率 |
-| `--log_dir` | `./logs` | `--log_dir logs` | TensorBoard 和运行日志根目录 |
-| `--model_dir` | `./models` | `--model_dir models` | checkpoint 和 final 模型根目录 |
-| `--csv_dir` | `./data/csv` | `--csv_dir data/csv` | episode/reward/training CSV 输出根目录 |
+| `--log_dir` | `./output/logs` | `--log_dir output/logs` | TensorBoard 和运行日志根目录 |
+| `--model_dir` | `./output/models` | `--model_dir output/models` | checkpoint 和 final 模型根目录 |
+| `--csv_dir` | `./output/data/csv` | `--csv_dir output/data/csv` | episode/reward/training CSV 输出根目录 |
 | `--mix_ratio` | `0.0` | `--mix_ratio 0.2` | 穿插训练比例（仅 Stage 2+），使用前一课程策略的回合占比，默认 0.0 不开启 |
 
 训练阶段保持随机化：策略可在 reset 时自行采样场景参数，速度能力也在每个 episode 随机采样。评估入口中的固定控制参数只影响验证，不影响训练。
 
 训练 epsoide 指标统一为 `train_score`（0-100 百分制评分），不区分课程编号前缀。`train_score > 60` 记为训练成功。CSV 中 `episode_log.csv` 精简为 6 列：`timestep, stage, reward, length, success, train_score`。每步奖励分项按课程独立存储在 `reward_log_stageN.csv` 中。
 
-训练时的周期性控制台日志会使用清晰的滚动窗口命名，例如：
+训练时的课程状态行使用短格式，避免和底部进度条互相挤压，例如：
 
 ```text
-[   128,000] Stage 1 Hover-Static | Eps=36 | SuccessRate30=42.0% | AvgTrainScore30=58.5 | AvgLen30=3600 | AvgReward30=+123.4
+[60.48M] S2 Hover-Moving | eps=757 | SR30=0.0% | score30=0.0 | len30=3600 | rew30=+12312.6
 ```
 
-其中 `SuccessRate30` 表示最近 30 个 episode 的滚动成功率，窗口大小来自 `CurriculumConfig.window_size`，不是 30 个训练 step。
+其中 `SR30` 表示最近 30 个 episode 的滚动成功率，窗口大小来自 `CurriculumConfig.window_size`，不是 30 个训练 step。课程状态行由 `TrainConfig.curriculum_status_interval_episodes` 控制，按当前阶段有效 episode 增量打印；没有新 episode 时仍会写 TensorBoard 指标，但不会重复刷同一行到控制台。
 
 示例：
 
 ```powershell
-# 默认只训练起始课程
+# 默认从 Stage 1 开始，允许手动继续到最高 Stage 4
 conda run --no-capture-output -n drone_rl python scripts\train.py
+
+# 只训练单个课程
+conda run --no-capture-output -n drone_rl python scripts\train.py --stage 1 --max_stage 1
 
 # 手动多阶段课程：每个阶段结束后输入 Y/N
 conda run --no-capture-output -n drone_rl python scripts\train.py --stage 1 --max_stage 4
@@ -472,22 +476,22 @@ conda run --no-capture-output -n drone_rl python scripts\train.py --stage 1 --ma
 conda run --no-capture-output -n drone_rl python scripts\train.py --n_envs 4 --total_steps 20000 --exp_name smoke_test --device cpu
 
 # 从指定课程和已有 checkpoint 恢复
-conda run --no-capture-output -n drone_rl python scripts\train.py --stage 3 --resume models\drone_landing\ckpt_0001000000 --max_stage 4
+conda run --no-capture-output -n drone_rl python scripts\train.py --stage 3 --resume output\models\drone_landing\ckpt_0001000000 --max_stage 4
 
 # 完整参数示例
 conda run --no-capture-output -n drone_rl python scripts\train.py `
   --stage 1 `
-  --max_stage 1 `
-  --n_envs 16 `
+  --max_stage 4 `
+  --n_envs 96 `
   --device cuda `
   --exp_name stage1_hover `
   --seed 42 `
   --total_steps 60000000 `
-  --batch_size 512 `
+  --batch_size 2048 `
   --lr 0.0003 `
-  --log_dir ./logs `
-  --model_dir ./models `
-  --csv_dir ./data/csv
+  --log_dir ./output/logs `
+  --model_dir ./output/models `
+  --csv_dir ./output/data/csv
 ```
 
 SAC 默认配置：
@@ -497,7 +501,7 @@ SAC 默认配置：
 | `learning_rate` | `3e-4` |
 | `buffer_size` | `1_000_000` |
 | `learning_starts` | `10_000` |
-| `batch_size` | `512` |
+| `batch_size` | `2048` |
 | `tau` | `0.005` |
 | `gamma` | `0.99` |
 | `train_freq` | `1` |
@@ -505,12 +509,14 @@ SAC 默认配置：
 | `ent_coef` | `auto` |
 | `net_arch` | `[256, 256, 256]` |
 
+默认阶段预算为 Stage 1: 60M timesteps，Stage 2/3/4: 各 30M timesteps。`--total_steps` 会覆盖所有所选阶段的单阶段预算。
+
 训练产物：
 
 ```text
-logs/{exp_name}/
-models/{exp_name}/
-data/csv/{exp_name}/
+output/logs/{exp_name}/
+output/models/{exp_name}/
+output/data/csv/{exp_name}/
 ```
 
 ## 13. 评估系统
@@ -518,32 +524,32 @@ data/csv/{exp_name}/
 评估入口：
 
 ```powershell
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\drone_landing\model_final --stage 4
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 4
 ```
 
 常用功能：
 
 ```powershell
 # GUI 渲染
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\drone_landing\model_final --stage 4 --render
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 4 --render
 
 # 评估全部阶段
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\drone_landing\model_final --all_stages
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --all_stages
 
 # 使用交互/默认验证参数
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\stage1_v2\model_final --stage 1 --episodes 20
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 1 --episodes 20
 
 # 完全无交互验证：手动指定策略需要的评估参数
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\stage1_v2\model_final --stage 1 --episodes 20 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 1 --episodes 20 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
 
 # 覆盖评估回合最大步数
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\drone_landing\model_final --stage 1 --eval_max_steps 12000 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 1 --eval_max_steps 12000 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
 
 # 轨迹采集和离线绘图
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\drone_landing\model_final --stage 1 --episodes 10 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2 --traj_enable --traj_plot --traj_plot_per_episode --traj_plot_combined
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 1 --episodes 10 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2 --traj_enable --traj_plot --traj_plot_per_episode --traj_plot_combined
 
 # 实时绘图
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\drone_landing\model_final --stage 1 --episodes 5 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2 --render --traj_enable --traj_plot --traj_plot_realtime
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 1 --episodes 5 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2 --render --traj_enable --traj_plot --traj_plot_realtime
 ```
 
 评估入口支持固定策略目标参数和速度能力。是否使用这些参数由活动课程策略决定：
@@ -566,7 +572,7 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model mod
 | `traj_plot_realtime` | `false` |
 | `traj_plot_per_episode` | `true` |
 | `traj_plot_combined` | `true` |
-| `traj_out_dir` | `data/eval_traj` |
+| `traj_out_dir` | `output/data/eval_traj` |
 | `traj_stride` | `1` |
 | `traj_realtime_refresh` | `10` |
 
@@ -575,7 +581,7 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model mod
 TensorBoard：
 
 ```powershell
-conda run --no-capture-output -n drone_rl tensorboard --logdir logs
+conda run --no-capture-output -n drone_rl tensorboard --logdir output/logs
 ```
 
 浏览器打开：
@@ -598,18 +604,21 @@ http://localhost:6006
 | `curriculum/rolling_train_score` | 当前课程训练口径滚动百分制分数 |
 | `curriculum/actual_mix_ratio` | 穿插训练实际混合比例（未开启时为 0.0） |
 
-环境 `info` 中还会提供轻量扰动调试指标，便于训练时确认实际速度来源：
+控制台输出分为两类：SB3 主表格 `rollout/...` / `train/...` 由 `TrainConfig.sb3_log_interval_episodes` 控制，按全局完成 episode 数触发；课程状态短行由 `TrainConfig.curriculum_status_interval_episodes` 控制，按当前阶段有效 episode 数触发。checkpoint 由 `TrainConfig.save_freq` 控制，按真实 `num_timesteps` 保存；默认约每 4.8M timesteps 保存一次。CSV flush 仍由 callback 内部按真实 `num_timesteps` 周期执行。
+
+环境 `info` 中还会提供轻量扰动和奖励调试指标，便于训练时确认实际速度来源：
 
 | 指标 | 含义 |
 | --- | --- |
-| `reward/velocity_toward` | 悬停阶段实际速度方向朝向目标点的奖惩 |
-| `reward/pos_xy` | Stage 2 门控后的水平位置奖励分项 |
-| `reward/pos_z` | Stage 2 门控后的高度位置奖励分项 |
-| `metric/xy_gate_for_z` | Stage 2 高度奖励的水平距离门控 |
-| `metric/z_gate_for_xy` | Stage 2 水平奖励的垂直距离门控 |
-| `metric/stability_coeff` | 悬停稳定速度惩罚系数，范围 `[0, 1]` |
-| `metric/velocity_toward_cos` | 实际速度方向与目标方向夹角余弦 |
-| `metric/velocity_toward_weight` | 速度朝向奖励的距离权重和速度权重乘积 |
+| `reward/pos` | 当前课程的位置奖励分项 |
+| `reward/vel` | Stage 1 近距速度惩罚 |
+| `reward/vel_match` | Stage 2 近距相对速度匹配惩罚 |
+| `reward/velocity_toward` | Stage 1 速度方向朝向目标点的 shaping |
+| `reward/yaw` / `reward/yaw_rate` | 偏航角和偏航角速度惩罚 |
+| `reward/action` | 动作平滑和幅值惩罚 |
+| `metric/horiz_err` / `metric/vert_err` | 目标水平/垂直误差 |
+| `metric/rel_speed` / `metric/plat_speed` | Stage 2 相对速度和平台速度 |
+| `metric/gate_vm` | Stage 2 速度匹配门控 |
 | `metric/wind_speed` | 当前总水平风速大小 |
 | `metric/base_wind_speed` | 当前 episode 固定弱漂移大小 |
 | `metric/gust_speed` | 当前阵风速度大小 |
@@ -618,18 +627,18 @@ http://localhost:6006
 CSV 输出：
 
 ```text
-data/csv/{exp_name}/
+output/data/csv/{exp_name}/
 ├── episode_log.csv        每回合：timestep, stage, reward, length, success, train_score
 ├── reward_log_stageN.csv  每步奖励分项和距离/速度指标（按课程分文件，N 为课程编号）
 └── training_log.csv       定期记录 actor_loss, critic_loss, ent_coef, lr, fps
 ```
 
-`episode_log.csv` 中 `train_score` 统一命名无课程前缀，按 `stage` 列区分课程。`reward_log_stage1.csv` 和 `reward_log_stage2.csv` 按课程分别记录奖励分项；Stage 2 额外包含速度匹配、相对速度、平台速度、位置门控和朝向目标 shaping 诊断列。
+`episode_log.csv` 中 `train_score` 统一命名无课程前缀，按 `stage` 列区分课程。`reward_log_stage1.csv` 和 `reward_log_stage2.csv` 按课程分别记录奖励分项；Stage 2 额外包含速度匹配、相对速度、平台速度和速度匹配门控等诊断列。逐步 reward CSV 会按每步、每环境写入，长训练会快速增长到 GB 级；需要控制磁盘占用时应优先降低记录频率或只在 debug 实验中开启逐步 reward 分析。
 
 MATLAB 读取示例：
 
 ```matlab
-T = readtable('data/csv/drone_landing/episode_log.csv');
+T = readtable('output/data/csv/drone_landing/episode_log.csv');
 stage1 = T(T.stage == 1, :);
 plot(stage1.timestep, movmean(stage1.success, 50));
 xlabel('Timestep');
@@ -648,7 +657,7 @@ title('Curriculum Learning Curve');
 示例：
 
 ```powershell
-conda run --no-capture-output -n drone_rl python scripts\export_model.py --model models\drone_landing\model_final --format all --verify
+conda run --no-capture-output -n drone_rl python scripts\export_model.py --model output\models\drone_landing\model_final --format all --verify
 ```
 
 导出的模型输入为 34 维观测，输出为 4 维 `[-1, 1]` 动作。
@@ -741,80 +750,46 @@ class GazeboEnv(BaseDroneLandingEnv):
 修改平台运动：
 
 - 课程到平台运动的映射位于 `curriculum/strategies/` 的各个策略类中。
-- 策略通过 `MovingPlatform.set_motion(...)` 选择 `static`、`sinusoidal` 等轨迹；新增课程只需新增并注册策略类。
-- 如果需要全新的轨迹形状，再在 `moving_platform.py` 中增加运动模式。
+- 策略通过 `MovingPlatform.set_motion_strategy(...)` 选择 `StaticMotion`、`LissajousMotion`、`PatrolMotion`、`WaypointMotion` 等轨迹；新增课程只需新增并注册策略类。
+- 如果需要全新的轨迹形状，再在 `envs/landing_platform/motions/` 中增加运动策略。
 
-## 18. 当前已有产物和训练观察
+## 18. 当前状态和风险
 
-已有模型目录：
-
-```text
-models/stage1_v1/
-models/stage1_v2/
-models/smoke_obs34/
-```
-
-已有 CSV：
-
-```text
-data/csv/stage1_hover/
-data/csv/stage1_20260413/
-data/csv/smoke_obs34/
-```
-
-从当前 CSV 观察：
-
-- `stage1_20260413` 有 8704 个 episode，`success=0` 全部为 0。
-- `stage1_hover` 有 544 个 episode，`success=0` 全部为 0。
-- 训练奖励可以变为正值，但课程成功率仍长期为 0。
-
-这些是旧训练产物，字段和当前 reward CSV schema 可能不一致。后续新训练应优先查看回合奖励、回合长度、成功率，以及各阶段策略自己声明的指标。
-
-## 19. 已知风险和优先修复建议
-
-### 19.1 策略指标应由课程策略声明
+### 18.1 策略指标由课程策略声明
 
 旧实验中使用过 `hover_score` 作为 episode 指标。该指标已移除；新课程不需要沿用它，成功判定和评估字段应由对应策略独立声明。
 
-### 19.2 课程阶段切换已改为手动控制
+### 18.2 课程阶段切换为手动控制
 
 训练会在每个阶段预算步数结束后打印总结。若本次允许多个阶段，用户需要输入 `Y/N` 决定是否进入下一课程；非交互式运行默认按 `N` 保存退出。
 
-### 19.3 `--total_steps` 语义已改为每阶段预算
+### 18.3 `--total_steps` 表示每阶段预算
 
-`--total_steps` 现在表示每个所选课程阶段的训练步数。未传入 `--max_stage` 时只训练 `--stage` 指定的当前课程。
+`--total_steps` 表示每个所选课程阶段的训练步数。未传入时使用 `TrainConfig.curriculum.stage_timesteps` 中的默认预算。
 
-### 19.4 Stage 3/4 奖励待实现
+### 18.4 Stage 3/4 奖励待实现
 
 Stage 1 和 Stage 2 均可训练。Stage 3/4 已注册但奖励函数抛出 `NotImplementedError`，待后续设计。
 
-### 19.5 多阶段 CSV callback 句柄复用
+### 18.5 reward CSV 体积过大
 
-继续到 Stage 2 前，需要修复 `CSVLoggingCallback` 跨多个 `model.learn()` 复用时关闭 reward 文件句柄后未清空 `_reward_fhs/_reward_ws` 的问题，否则后续阶段可能在 flush 已关闭文件时失败。
+逐步 reward CSV 每步、每环境写入奖励分项，长训练会快速产生 GB 级数据。
 
-### 19.6 checkpoint 间隔与并行环境数
+当前 schema 已按课程分文件并精简列数。若仍然过大，后续可考虑 `reward_log_freq`、是否记录 reward CSV 的开关、只记录第 0 个环境，或默认只在 debug/smoke 实验中开启逐步 reward 日志。
 
-当前 `CheckpointCallback.save_freq` 按 callback 调用次数计算，多环境下实际保存间隔为 `save_freq * n_envs` timesteps。后续应统一改为按 `num_timesteps` 计算。
-
-### 19.7 reward CSV 体积过大
-
-现有 `data/csv/stage1_20260413/reward_log.csv` 约 3.63GB。当前每步、每环境写入奖励分项，长训练会快速产生 GB 级数据。
-
-当前新 schema 已精简逐步 reward 列。若仍然过大，后续再考虑 `reward_log_freq`、是否记录 reward CSV 的开关、只记录第 0 个环境，或默认只在 debug/smoke 实验中开启逐步 reward 日志。
-
-### 19.8 仿真和真实系统存在 sim-to-real 缺口
+### 18.6 仿真和真实系统存在 sim-to-real 缺口
 
 当前 PyBullet 环境是运动学体，没有真实重力、气动、电机动力学或 PX4 内环细节。适合训练高层速度策略，但迁移到真实系统前需要更高保真验证。
 
-## 20. 推荐后续工作顺序
+## 19. 推荐后续工作顺序
 
 1. 用 `drone_rl` 环境跑短训练 smoke test，并检查简化后的 episode/reward CSV。
-2. 对已有 `stage1_v1/v2` 模型做统一评估，确认策略是否实际能稳定悬停。
-3. 单个课程稳定后，再为下一个注册课程设计奖励、指标和评估方式。
-4. 进入 Stage 2 前修复多阶段 CSV callback 句柄和 checkpoint 间隔问题。
+2. 分别验证 Stage 1 和 Stage 2 的训练曲线、成功率和评估口径。
+3. 若逐步 reward CSV 体积影响长训练，再增加采样频率或开关。
+4. 单个课程稳定后，再为 Stage 3/4 设计奖励、指标和评估方式。
 5. 若 PyBullet 阶段稳定，再规划 Gazebo/PX4 后端迁移。
 
-## 21. 常用命令速查
+## 20. 常用命令速查
 
 环境自检：
 
@@ -844,7 +819,7 @@ conda run --no-capture-output -n drone_rl python scripts\train.py --stage 1 --ma
 
 ```powershell
 conda run --no-capture-output -n drone_rl python scripts\evaluate.py `
-  --model models\stage1_v2\model_final `
+  --model output\models\drone_landing\model_final `
   --stage 1 `
   --episodes 20 `
   --eval_max_steps 3600 `
@@ -860,7 +835,7 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py `
   --traj_plot_realtime `
   --traj_plot_per_episode `
   --traj_plot_combined `
-  --traj_out_dir data/eval_traj `
+  --traj_out_dir output/data/eval_traj `
   --traj_stride 1 `
   --traj_realtime_refresh 10
 ```
@@ -868,14 +843,14 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py `
 常用精简版：
 
 ```powershell
-conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model models\stage1_v2\model_final --stage 1 --episodes 20 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
+conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model output\models\drone_landing\model_final --stage 1 --episodes 20 --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
 ```
 
 评估 CLI 参数：
 
 | 参数 | 示例 | 说明 |
 | --- | --- | --- |
-| `--model` | `models\stage1_v2\model_final` | 模型路径，不带 `.zip` |
+| `--model` | `output\models\drone_landing\model_final` | 模型路径，不带 `.zip` |
 | `--stage` | `1` | 评估课程 id |
 | `--episodes` | `20` | 评估 episode 数 |
 | `--eval_max_steps` | `3600` | 仅评估生效的单回合最大步数 |
@@ -893,7 +868,7 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model mod
 | `--traj_plot_realtime` | 开关 | 评估时显示实时轨迹图 |
 | `--traj_plot_per_episode` / `--no-traj_plot_per_episode` | 开关 | 是否输出单 episode 图，默认开启 |
 | `--traj_plot_combined` / `--no-traj_plot_combined` | 开关 | 是否输出跨 episode 汇总图，默认开启 |
-| `--traj_out_dir` | `data/eval_traj` | 轨迹输出根目录 |
+| `--traj_out_dir` | `output/data/eval_traj` | 轨迹输出根目录 |
 | `--traj_stride` | `1` | 每隔多少 step 记录一行轨迹 |
 | `--traj_realtime_refresh` | `10` | 实时图每隔多少 step 刷新 |
 | `--save_traj` | 开关 | 旧版轨迹保存开关，保留兼容；新流程优先用 `--traj_enable` |
@@ -901,74 +876,19 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model mod
 TensorBoard：
 
 ```powershell
-conda run --no-capture-output -n drone_rl tensorboard --logdir logs
+conda run --no-capture-output -n drone_rl tensorboard --logdir output/logs
 ```
 
 模型导出：
 
 ```powershell
-conda run --no-capture-output -n drone_rl python scripts\export_model.py --model models\drone_landing\model_final --format all --verify
+conda run --no-capture-output -n drone_rl python scripts\export_model.py --model output\models\drone_landing\model_final --format all --verify
 ```
 
-## 22. 本轮文档整理记录
+## 21. 文档整理记录
 
-2026-04-26：
+2026-05-08：
 
-- 将原 `README.md`、`ARCHITECTURE.md` 和项目分析记录合并到本文件。
-- 根目录以 `README.md` 作为总入口；主要源码目录新增目录级 `README.md`。
-- 修正原文档中平台目录旧命名，将 `envs/platform/` 统一为真实目录 `envs/landing_platform/`。
-- 记录 conda 环境 `drone_rl` 和 Windows 下推荐的 `conda run --no-capture-output` 用法。
-- 记录 `scripts/test_env.py` 在 `drone_rl` 环境中全部通过。
-- 按源码脚本文件补充中文功能说明，便于后续 ROS/Gazebo 迁移前理解模块边界。
-
-2026-04-28：
-
-- 将运行命令中的 conda 环境名统一更新为 `drone_rl`（原 SAC 环境已弃用）。
-- 完整验证 `drone_rl` 环境兼容性：
-  - `scripts/test_env.py`：25 项测试全部通过，单环境 FPS 5,269（满足并行要求）
-  - `scripts/train.py` 冒烟测试：2 环境 × 64 步训练完成，SAC/SubprocVecEnv/日志/模型保存均正常
-  - `scripts/evaluate.py` 参数解析正常
-  - PyTorch 2.7.1+cu128、CUDA 12.8、RTX 4070 Ti SUPER GPU 支持验证通过
-- 同步 `requirements.txt` 到 `drone_rl` 中已验证的核心包版本范围。
-- 更新第 2 节环境验证记录，详细列出功能验证清单和性能基准。
-
-2026-05-05：
-
-- **课程结构调整**：Stage 2 从 Land-Static 替换为 Hover-Moving（移动平台上方悬停），完整实现奖励函数（8 组件，核心新增速度匹配奖励 `r_vel_match`）、成功判定和指标。
-- **文件整理**：`stage3_hover_moving.py` → `stage3.py`、`stage4_land_moving.py` → `stage4.py`，类名改为 `Stage3Strategy`/`Stage4Strategy`，去除未确定课程的功能描述。删除 `stage2_land_static.py`。
-- **统一训练输出**：
-  - `episode_log.csv` 精简为 6 列（`timestep, stage, reward, length, success, train_score`），指标名去课程前缀。
-  - 删除 `registered_episode_metric_keys()` 函数和 `base_env.py` 中的补齐逻辑。
-  - `episode_info_keywords()` 固定为 `("success", "episode_stage", "train_score")`。
-- **穿插训练**（仅 Stage 2+）：新增 `--mix_ratio` CLI 参数，每回合以指定概率使用前一课程策略。修复 4 个 Bug（`_nominal_stage` 缺失、初始策略未缓存、直接启动无前置缓存、TensorBoard 指标被稀释）。
-- `scripts/test_env.py`：全部 22 项测试通过（单环境 ~6,200 FPS）。
-- 更新 README 文档反映上述变更。
-
-2026-05-06：
-
-- **删除 SinusoidalMotion**：被 LissajousMotion 覆盖（频率池含 1.0:0.7），Stage 3/4 同步替换。
-- **运动策略范围重设计**：Waypoint 航点范围 [-50,50]²（原 [-30,30]²），边距 ≥10m（原 1m）；Patrol 目标距离 15-40m（原 2-5m）；Lissajous 每 episode 随机幅值 15-35m×10-30m（原 2m×1m）。
-- **OOB 改为绝对地图边界**（Stage 2）：|x|,|y| ≤ 100m，z ≥ 0。Strategy 基类新增 `get_map_bounds()` hook。
-- **无人机出生位置改为外环**（Stage 2）：[-80,80]² 但排除 [-50,50]² 平台活动区。Strategy 基类新增 `get_spawn_position()` hook。
-- **速度系统修正**：MotionStrategy.step() 返回完整速度 vel_xy，MovingPlatform 不再缩放。时间参数化策略（Lissajous）使用分析导数；路径累积策略（Patrol/Waypoint）使用 speed × direction。
-- **卡尔曼滤波器改为纯位置观测**：MEAS_DIM 4→2，H=[I₂ 0₂]，速度由匀速模型从位置差/dt 推算。
-- **平台速度范围调整**：SpeedController 输出 0.3-4.5 m/s（原 0.2-1.6），无人机 8-20 m/s 始终大于平台。
-- **奖励参数优化**：r_pos σ 放宽（0.25→0.30, 0.20→0.22），vel_gate 过渡带宽 1.5m（原 0.5m），r_vel_match 与 r_vel 共用 vel_gate。
-- `scripts/test_env.py`：全部 22 项测试通过（单环境 ~6,000 FPS）。
-- 更新 README 文档反映上述变更。
-
-2026-05-06（Stage 2 平台运动与速度观测修复）：
-
-- **Stage 2 统一速度控制**：Lissajous/Patrol/Waypoint 均消费 `SpeedController` 输出的标量速度，按路径弧长推进；位置差分速度和报告速度受控在 5m/s 内。
-- **异常位移修复**：`MovingPlatform.reset()` 同步到 motion 初始位置；Patrol/Waypoint 换段保留 overshoot，Lissajous 使用闭合曲线连续循环。
-- **速度观测简化**：Stage 2 不再使用 KF 从位置估计平台速度，改为真实平台速度 + 默认 2 step 延迟 + `Uniform(0.98, 1.02)` 比例误差。KF 文件保留给未来真实传感器版本。
-- **测试覆盖**：`scripts/test_env.py` 增加 Stage 2 平台运动连续性和速度观测测试。
-
-2026-05-06（eval 与轨迹可视化修复）：
-
-- **eval 双分数**：`episode_metrics` 新增 `eval_score`，评估打印同时显示 `Train` 和 `Eval` 分数，消除口径不一致。
-- **base_env 暴露滤波状态**：新增 `_platform_state_filtered` 属性，供轨迹记录和外部访问。
-- **轨迹 CSV 新增滤波列**：`platform_fx/fy/fz`、`platform_fvx/fvy/fvz`、`target_fx/fy/fz`，记录模型实际观测的 KF 滤波状态。
-- **实时/离线轨迹图增加滤波线**：3D 图中以虚线显示滤波后的平台位置和目标点，速度图中显示滤波后的平台速度。Stage 1 滤波线与真值重合，Stage 2 可见 KF 估计偏差。
-- `scripts/test_env.py`：全部 22 项测试通过。
-- 更新 README 文档。
+- 同步训练默认值、课程状态和日志频率语义。
+- 移除旧实验产物清单，更新 callback/checkpoint 频率语义。
+- 更新 Stage 2 当前奖励说明和 CSV/TensorBoard 字段说明。
