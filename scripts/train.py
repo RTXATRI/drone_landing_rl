@@ -28,13 +28,38 @@ import os
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from configs.env_config import EnvConfig
-from configs.train_config import CurriculumConfig, SACConfig, TrainConfig
-from curriculum.strategies import registered_stage_ids
-from training.trainer import Trainer
+
+def _parse_stage_envs(value: str) -> dict:
+    """Parse CLI values like '1=50,2=50,3=32'."""
+    result = {}
+    if not value:
+        return result
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                "Expected comma-separated STAGE=NUM pairs, e.g. 1=50,2=50"
+            )
+        stage_text, count_text = item.split("=", 1)
+        try:
+            stage = int(stage_text.strip())
+            count = int(count_text.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "Stage and env count must be integers, e.g. 1=50,2=50"
+            ) from exc
+        if count < 1:
+            raise argparse.ArgumentTypeError("Eval env count must be >= 1")
+        result[stage] = count
+    return result
 
 
 def parse_args() -> argparse.Namespace:
+    from configs.train_config import TrainConfig
+    from curriculum.strategies import registered_stage_ids
+
     defaults = TrainConfig()
     p = argparse.ArgumentParser(
         description="Train drone landing RL agent (SAC + Curriculum)",
@@ -71,13 +96,57 @@ def parse_args() -> argparse.Namespace:
                    help="穿插训练比例：使用前一课程策略的回合占比（0.0-1.0，默认 0.0 不开启）")
     p.add_argument("--csv_dir",      type=str,   default=defaults.csv_dir,
                    help="CSV output root directory")
+    p.add_argument(
+        "--reward_step_csv",
+        action="store_true",
+        default=defaults.reward_step_csv_enabled,
+        help="Enable per-step reward breakdown CSV logging",
+    )
+    p.add_argument(
+        "--best_model_selection",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.best_model_selection_enabled,
+        help="Enable per-stage best-model candidate collection and final evaluation",
+    )
+    p.add_argument("--best_grid_count", type=int, default=defaults.best_model_grid_count,
+                   help="Number of evenly spaced per-stage best-model grid candidates")
+    p.add_argument("--best_interval_top_m", type=int,
+                   default=defaults.best_model_interval_top_m,
+                   help="Number of high-reward candidates kept in each grid interval")
+    p.add_argument("--best_eval_episodes", type=int,
+                   default=defaults.best_model_eval_episodes,
+                   help="Episodes per candidate in final best-model evaluation")
+    p.add_argument("--best_eval_envs", type=_parse_stage_envs,
+                   default=dict(defaults.best_model_eval_envs_by_stage),
+                   help="Per-stage parallel eval envs, e.g. 1=50,2=50,3=32")
+    p.add_argument("--best_keep_top_n", type=int,
+                   default=defaults.best_model_keep_top_n,
+                   help="Number of final top models to keep after best-model evaluation")
     args = p.parse_args()
     if args.max_stage < args.stage:
         p.error("--max_stage must be greater than or equal to --stage")
+    if args.best_grid_count < 1:
+        p.error("--best_grid_count must be >= 1")
+    if args.best_interval_top_m < 0:
+        p.error("--best_interval_top_m must be >= 0")
+    if args.best_eval_episodes < 1:
+        p.error("--best_eval_episodes must be >= 1")
+    if args.best_keep_top_n < 1:
+        p.error("--best_keep_top_n must be >= 1")
+    unknown_best_eval_stages = sorted(set(args.best_eval_envs) - set(stage_ids))
+    if unknown_best_eval_stages:
+        p.error(f"--best_eval_envs contains unknown stages: {unknown_best_eval_stages}")
+    merged_best_eval_envs = dict(defaults.best_model_eval_envs_by_stage)
+    merged_best_eval_envs.update(args.best_eval_envs)
+    args.best_eval_envs = merged_best_eval_envs
     return args
 
 
 def main() -> None:
+    from configs.env_config import EnvConfig
+    from configs.train_config import CurriculumConfig, SACConfig, TrainConfig
+    from training.trainer import Trainer
+
     args = parse_args()
 
     # ── 环境配置（使用默认值；物理参数优先在 env_config.py 中调整）
@@ -102,6 +171,13 @@ def main() -> None:
         log_dir = args.log_dir,
         model_dir = args.model_dir,
         csv_dir = args.csv_dir,
+        reward_step_csv_enabled = args.reward_step_csv,
+        best_model_selection_enabled = args.best_model_selection,
+        best_model_grid_count = args.best_grid_count,
+        best_model_interval_top_m = args.best_interval_top_m,
+        best_model_eval_episodes = args.best_eval_episodes,
+        best_model_eval_envs_by_stage = args.best_eval_envs,
+        best_model_keep_top_n = args.best_keep_top_n,
         sac = sac_cfg,
         curriculum = cur_cfg,
     )

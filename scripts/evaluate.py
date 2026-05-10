@@ -555,11 +555,6 @@ def _write_csv_rows(path: str, fieldnames: List[str], rows: List[Dict]) -> None:
         writer.writerows(rows)
 
 
-def prompt_hover_height(env_config: EnvConfig) -> float:
-    """面向旧调用方的向后兼容包装函数。"""
-    return _prompt_positive_float("评估悬停高度", EVAL_HOVER_HEIGHT_DEFAULT, "m")
-
-
 def evaluate_stage(
     model: SAC,
     env_config: EnvConfig,

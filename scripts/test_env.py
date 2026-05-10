@@ -790,7 +790,7 @@ def test_stage2_strategy_reward_shape() -> bool:
     _, vm_far = _info_at([3.0, 0.0, 5.0], velocity=(0.5, 0.0, 0.0))
 
     # 位置奖励在目标中心处最大
-    ok &= _check(center["reward/pos"] > 6.0,
+    ok &= _check(center["reward/pos"] >= 6.0,
                  f"Stage 2 target-center position reward is strong  [got {center['reward/pos']:.4f}]")
     # 位置奖励随距离单调衰减
     ok &= _check(center["reward/pos"] > near["reward/pos"] > mid["reward/pos"],
@@ -813,12 +813,281 @@ def test_stage2_strategy_reward_shape() -> bool:
     expected_keys = {
         "reward/pos", "reward/vel_match", "reward/yaw",
         "reward/yaw_rate", "reward/action", "reward/total",
+        "reward/hold", "reward/hold_break",
         "metric/dist", "metric/horiz_err", "metric/vert_err",
         "metric/speed", "metric/rel_speed", "metric/plat_speed",
-        "metric/gate_vm",
+        "metric/r_hold_total", "metric/gate_vm",
     }
     ok &= _check(expected_keys.issubset(center.keys()),
                  "Stage 2 reward info exposes all required simplified keys")
+    return ok
+
+
+def test_hold_reward_space_independence() -> bool:
+    _header("Test 22b: Hold Reward Space Independence")
+    ok = True
+    cfg = EnvConfig()
+
+    class DummyEnv:
+        pass
+
+    def _env():
+        env = DummyEnv()
+        env._current_v_xy_max = 1.0
+        env._current_vz_up_max = 1.0
+        env._current_vz_down_max = 1.0
+        return env
+
+    def _reward_info(strategy, env, drone, platform, target, hold_steps=0):
+        _, info = strategy.compute_reward(
+            env=env,
+            drone_state=drone,
+            platform_state=platform,
+            action=np.zeros(4, dtype=np.float32),
+            prev_action=np.zeros(4, dtype=np.float32),
+            target_pos=target,
+            hold_steps=hold_steps,
+            prev_hold_steps=hold_steps,
+        )
+        return info
+
+    # Stage 1: reward hold space is independent from env-level hold_steps.
+    s1 = create_strategy(1, cfg)
+    env1 = _env()
+    target1 = np.array([0.0, 0.0, 2.0], dtype=np.float32)
+    platform1 = {
+        "position": np.zeros(3, dtype=np.float32),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "angular_rate": np.zeros(3, dtype=np.float32),
+    }
+    stable1 = {
+        "position": target1.copy(),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    train_only1 = {
+        "position": np.array([0.15, 0.0, 2.0], dtype=np.float32),
+        "velocity": np.array([0.12, 0.0, 0.0], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    s1.reset_episode_metrics(env1, stable1, platform1)
+    s1_stable = _reward_info(s1, env1, stable1, platform1, target1, hold_steps=0)
+    ok &= _check(np.isclose(s1_stable["reward/hold"], 0.05),
+                 "Stage 1 reward hold triggers from reward space, not input hold_steps")
+
+    s1.reset_episode_metrics(env1, stable1, platform1)
+    s1_outside = _reward_info(s1, env1, train_only1, platform1, target1, hold_steps=99)
+    ok &= _check(np.isclose(s1_outside["reward/hold"], 0.0),
+                 "Stage 1 input hold_steps cannot force reward hold outside reward space")
+    s1.update_step_metrics(env1, train_only1, platform1, target1)
+    ok &= _check(env1._stage1_train_hit_steps == 1 and env1._stage1_eval_hold_steps == 0,
+                 "Stage 1 train_score space can differ from eval/reward hold space")
+
+    # Stage 2 uses relative speed in all three spaces, but with independent thresholds.
+    s2 = create_strategy(2, cfg)
+    env2 = _env()
+    target2 = np.array([0.0, 0.0, 5.0], dtype=np.float32)
+    platform2 = {
+        "position": np.zeros(3, dtype=np.float32),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "angular_rate": np.zeros(3, dtype=np.float32),
+    }
+    stable2 = {
+        "position": target2.copy(),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    train_only2 = {
+        "position": np.array([0.20, 0.0, 5.0], dtype=np.float32),
+        "velocity": np.array([0.05, 0.0, 0.0], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    s2.reset_episode_metrics(env2, stable2, platform2)
+    s2_stable = _reward_info(s2, env2, stable2, platform2, target2, hold_steps=0)
+    ok &= _check(np.isclose(s2_stable["reward/hold"], 0.05),
+                 "Stage 2 reward hold triggers from reward space, not input hold_steps")
+
+    s2.reset_episode_metrics(env2, stable2, platform2)
+    s2_outside = _reward_info(s2, env2, train_only2, platform2, target2, hold_steps=99)
+    ok &= _check(np.isclose(s2_outside["reward/hold"], 0.0),
+                 "Stage 2 input hold_steps cannot force reward hold outside reward space")
+    s2.update_step_metrics(env2, train_only2, platform2, target2)
+    ok &= _check(env2._stage2_train_hit_steps == 1 and env2._stage2_eval_hold_steps == 0,
+                 "Stage 2 train_score space can differ from eval/reward hold space")
+    return ok
+
+
+def test_success_mode_score_consistency() -> bool:
+    _header("Test 22c: Success Mode Score Consistency")
+    ok = True
+    cfg = EnvConfig()
+
+    class DummyEnv:
+        def __init__(self, mode="train"):
+            self._mode = mode
+            self._current_v_xy_max = 1.0
+            self._current_vz_up_max = 1.0
+            self._current_vz_down_max = 1.0
+
+        def get_success_mode(self):
+            return self._mode
+
+    cases = (
+        (
+            1,
+            np.array([0.0, 0.0, 2.0], dtype=np.float32),
+            "_stage1_train_hit_steps",
+            "_stage1_train_possible_steps",
+            "_stage1_eval_max_hold_steps",
+        ),
+        (
+            2,
+            np.array([0.0, 0.0, 5.0], dtype=np.float32),
+            "_stage2_train_hit_steps",
+            "_stage2_train_possible_steps",
+            "_stage2_eval_max_hold_steps",
+        ),
+    )
+
+    platform = {
+        "position": np.zeros(3, dtype=np.float32),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "angular_rate": np.zeros(3, dtype=np.float32),
+    }
+
+    for stage, target, train_hits_key, train_possible_key, eval_hits_key in cases:
+        strategy = create_strategy(stage, cfg)
+        env = DummyEnv()
+        drone = {
+            "position": target.copy(),
+            "velocity": np.zeros(3, dtype=np.float32),
+            "euler": np.zeros(3, dtype=np.float32),
+            "yaw_rate": np.float32(0.0),
+        }
+        strategy.reset_episode_metrics(env, drone, platform)
+        setattr(env, train_hits_key, int(getattr(env, train_possible_key)))
+        setattr(env, eval_hits_key, 0)
+
+        env._mode = "train"
+        train_mode_metrics = strategy.get_episode_metrics(env)
+        _, train_success = strategy.terminal_bonus(
+            env=env,
+            terminated=False,
+            truncated=True,
+            term_info={},
+        )
+
+        env._mode = "eval"
+        eval_mode_metrics = strategy.get_episode_metrics(env)
+        _, eval_success = strategy.terminal_bonus(
+            env=env,
+            terminated=False,
+            truncated=True,
+            term_info={},
+        )
+
+        ok &= _check(train_mode_metrics == eval_mode_metrics,
+                     f"Stage {stage}: train/eval modes compute the same score values")
+        ok &= _check(train_success and not eval_success,
+                     f"Stage {stage}: success_mode only selects train_score or eval_score")
+
+    return ok
+
+
+def test_stage2_hold_refund_reward() -> bool:
+    _header("Test 22d: Stage-2 Hold Reward Refund")
+    ok = True
+    cfg = EnvConfig()
+    strategy = create_strategy(2, cfg)
+    target = np.array([0.0, 0.0, 5.0], dtype=np.float32)
+    platform = {
+        "position": np.zeros(3, dtype=np.float32),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "angular_rate": np.zeros(3, dtype=np.float32),
+    }
+    drone = {
+        "position": target.copy(),
+        "velocity": np.zeros(3, dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+
+    class DummyEnv:
+        pass
+
+    env = DummyEnv()
+    env._current_v_xy_max = 1.0
+    env._current_vz_up_max = 1.0
+    env._current_vz_down_max = 1.0
+    env._stage2_reward_hold_steps = 0
+    env._stage2_r_hold_total = 3.0
+    env._stage2_hold_refund_steps = 9
+    env._stage2_is_refunding_hold = True
+
+    strategy.reset_episode_metrics(env, drone, platform)
+    ok &= _check(np.isclose(env._stage2_r_hold_total, 0.0),
+                 "Stage 2 reset clears hold reward balance")
+    ok &= _check(env._stage2_hold_refund_steps == 0,
+                 "Stage 2 reset clears hold refund steps")
+    ok &= _check(not env._stage2_is_refunding_hold,
+                 "Stage 2 reset clears hold refund state")
+
+    def _info_for(pos, velocity=(0.0, 0.0, 0.0)) -> dict:
+        drone_state = {
+            "position": np.array(pos, dtype=np.float32),
+            "velocity": np.array(velocity, dtype=np.float32),
+            "euler": np.zeros(3, dtype=np.float32),
+            "yaw_rate": np.float32(0.0),
+        }
+        _, info = strategy.compute_reward(
+            env=env,
+            drone_state=drone_state,
+            platform_state=platform,
+            action=np.zeros(4, dtype=np.float32),
+            prev_action=np.zeros(4, dtype=np.float32),
+            target_pos=target,
+            hold_steps=0,
+            prev_hold_steps=0,
+        )
+        return info
+
+    first_hold = _info_for(target)
+    second_hold = _info_for(target)
+    first_break = _info_for([1.0, 0.0, 5.0])
+    second_break = _info_for([1.0, 0.0, 5.0])
+
+    ok &= _check(np.isclose(first_hold["reward/hold"], 0.05),
+                 "Stage 2 hold reward starts at base rate")
+    ok &= _check(np.isclose(second_hold["reward/hold"], 0.10),
+                 "Stage 2 hold reward grows with consecutive hold steps")
+    ok &= _check(np.isclose(first_break["reward/hold_break"], -0.05),
+                 "Stage 2 hold break starts refunding accumulated reward")
+    ok &= _check(np.isclose(second_break["reward/hold_break"], -0.10),
+                 "Stage 2 hold refund rate increases while broken")
+    ok &= _check(np.isclose(env._stage2_r_hold_total, 0.0),
+                 "Stage 2 hold refund drains accumulated reward")
+    ok &= _check(not env._stage2_is_refunding_hold,
+                 "Stage 2 hold refund state closes after balance drains")
+
+    env._stage2_r_hold_total = 0.05
+    env._stage2_reward_hold_steps = 500
+    env._stage2_hold_refund_steps = 0
+    env._stage2_is_refunding_hold = False
+    capped_break = _info_for([1.0, 0.0, 5.0])
+    ok &= _check(np.isclose(capped_break["reward/hold_break"], -10.05),
+                 "Stage 2 capped hold break applies extra terminal penalty")
+
+    columns = strategy.reward_log_columns()
+    ok &= _check("reward_hold" in columns and "reward_hold_break" in columns,
+                 "Stage 2 reward CSV includes hold refund columns")
     return ok
 
 
@@ -1015,6 +1284,9 @@ def main():
         "Disturbance disabled":  test_disturbance_disabled_zero_drift(),
         "Stage-1 reward shape":  test_stage1_strategy_reward_shape(),
         "Stage-2 reward shape":  test_stage2_strategy_reward_shape(),
+        "Hold reward independence": test_hold_reward_space_independence(),
+        "Success mode score consistency": test_success_mode_score_consistency(),
+        "Stage-2 hold refund":   test_stage2_hold_refund_reward(),
         "Eval fixed controls":    test_eval_fixed_controls_config(),
         "Stage-2 platform motion": test_stage2_platform_motion_continuity(),
         "Stage-2 velocity obs":   test_stage2_platform_velocity_observation(),

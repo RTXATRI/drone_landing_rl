@@ -6,7 +6,6 @@
 
 - `curriculum_manager.py`：记录每个课程的 episode 数、成功数、平均奖励、平均长度和策略指标；维护滚动统计窗口。阶段切换由 `Trainer` 在阶段预算结束后询问用户手动决定。
 - `strategies/`：课程策略注册表和内置策略实现。新增课程时优先新增策略类并注册。
-- `strategies/kalman_filter.py`：平台运动状态的 4D 卡尔曼滤波器。当前 Stage 2 Python 预训练不再使用它估计速度，文件保留给未来真实传感器版本。
 
 ## 已注册课程
 
@@ -30,6 +29,16 @@
 
 策略指标统一命名为无课程前缀的通用名（如 `train_score`、`eval_score`），由 `stage` 列区分课程。`reward_log_stageN.csv` 按课程分文件存储，列名也无前缀。
 
+### 训练、奖励和评估空间
+
+悬停课程把空间判定拆成三套，避免奖励塑形和验收标准互相牵连：
+
+- `TRAIN_SCORE_*`：训练得分空间，用于 `train_score`。
+- `EVAL_SCORE_*`：评估得分空间，用于 `eval_score` 和环境级连续保持步数。
+- `HOLD_REWARD_*`：保持奖励空间，只在 `compute_reward()` 的保持奖励块附近定义，用于 `reward/hold` 和 `reward/hold_break`。
+
+Stage 1/2 的默认数值保持旧行为：训练空间较宽，评估空间保持原标准，奖励空间默认等于旧评估空间但可以独立调参。训练和评估环境都会按同一套策略参数计算 `train_score` 和 `eval_score`，`success_mode="eval"` 只改变 episode 成功判定选用哪个分数。新增课程时，训练/评估参数属于多方法共享常量，应放在类顶部；奖励塑形参数应放在 `compute_reward()` 对应奖励块附近。
+
 ## Stage 2 平台观测
 
 Stage 2 作为 Python 预训练，平台速度直接来自仿真真实速度，不再通过位置变化和 KF 推算。策略会加入轻量观测模拟：默认 2 step 延迟，并对 XY 速度乘以 `Uniform(0.98, 1.02)` 的 episode 级比例误差。平台位置和 yaw 仍保留小噪声与检测质量丢帧标记。
@@ -46,6 +55,7 @@ Stage 2 作为 Python 预训练，平台速度直接来自仿真真实速度，�
 2. 实现 `stage_id()`、`setup_scene()`、`compute_reward()`、`terminal_bonus()` 等方法。
 3. 在 `strategies/__init__.py` 的 `STRATEGY_MAP` 中注册。
 4. 策略中的 episode 指标使用通用命名（如 `("train_score",)`），不要加课程前缀。
+5. 若课程包含悬停保持奖励，按“训练、奖励和评估空间”拆分参数，不要让奖励空间复用评估空间的连续步数状态。
 
 ## 阶段切换逻辑
 

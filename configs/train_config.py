@@ -13,16 +13,16 @@ from typing import List, Dict, Any
 class SACConfig:
     """SAC 超参数，按 RTX 4070 Ti SUPER + i7-14700KF 调过一版。"""
     learning_rate: float = 3e-4
-    buffer_size: int = 1_000_000
+    buffer_size: int = 3_000_000
     learning_starts: int = 10_000
     batch_size: int = 2048          # 较大的 batch 有利于提高 GPU 利用率
-    tau: float = 0.005
+    tau: float = 0.010
     gamma: float = 0.99
     train_freq: int = 1
-    gradient_steps: int = 1         # 如果 GPU 利用率偏低，可以适当增大
+    gradient_steps: int = 8
     ent_coef: str = "auto"
     target_update_interval: int = 1
-    use_sde: bool = False           # 状态依赖探索
+    use_sde: bool = False
 
     # 网络结构：3 层 MLP，每层 256 个单元
     policy_kwargs: Dict[str, Any] = field(default_factory=lambda: {
@@ -51,7 +51,7 @@ class CurriculumConfig:
     # 已注册课程的预算步数（可通过 CLI --total_steps 覆盖）
     stage_timesteps: List[int] = field(default_factory=lambda: [
         60_000_000,
-        30_000_000,
+        120_000_000,
         30_000_000,
         30_000_000,
     ])
@@ -73,11 +73,27 @@ class TrainConfig:
     log_dir: str = "./output/logs"
     model_dir: str = "./output/models"
     csv_dir: str = "./output/data/csv"
+    reward_step_csv_enabled: bool = False
 
     # ── 输出频率 ─────────────────────────────────────────────────────────────
-    sb3_log_interval_episodes: int = 200          # SB3 主表格输出间隔（全局 episode）
+    sb3_log_interval_episodes: int = 10             # SB3 主表格输出间隔（全局 episode）
     curriculum_status_interval_episodes: int = 200  # 课程短行输出间隔（当前阶段 episode）
-    save_freq: int = 4_800_000                    # checkpoint 保存间隔（真实 timesteps）
+    save_freq: int = 2_400_000                      # checkpoint 保存间隔（真实 timesteps）
+
+    # ── 最佳模型自动筛选 ─────────────────────────────────────────────────────
+    best_model_selection_enabled: bool = True
+    best_model_grid_count: int = 20
+    best_model_interval_top_m: int = 5
+    best_model_eval_episodes: int = 50
+    best_model_eval_envs_by_stage: Dict[int, int] = field(default_factory=lambda: {
+        1: 50,
+        2: 50,
+        3: 50,
+        4: 50,
+    })
+    best_model_keep_top_n: int = 5
+    best_model_train_score_weight: float = 0.3
+    best_model_eval_score_weight: float = 0.7
 
     # ── 可复现性 ─────────────────────────────────────────────────────────────
     seed: int = 42

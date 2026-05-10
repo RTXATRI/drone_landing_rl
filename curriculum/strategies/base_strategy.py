@@ -3,7 +3,7 @@
 课程策略抽象。
 
 每个课程阶段独立负责目标点、场景设置、奖励、成功条件和日志字段。
-通用 RewardCalculator 已退役；具体奖励必须放在具体策略中。
+奖励必须放在具体策略中，便于每个课程独立维护公式和日志字段。
 
 设计规范
 ========
@@ -25,7 +25,7 @@
         def compute_reward(self, ...):   # 参数名和公式分离
             r_pos = self.POS_XY_SIGMA * ...
 
-例外：被多个方法共享的参数（如 HOLD_RADIUS、TRAIN_SUCCESS_RADIUS）
+例外：被多个方法共享的参数（如 EVAL_SCORE_RADIUS、TRAIN_SCORE_RADIUS）
 保留为类级常量，集中在类顶部并标注行内注释说明作用。
 """
 

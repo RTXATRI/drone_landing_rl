@@ -9,6 +9,7 @@
 #   - 三层位置函数：反二次（长尾）+ 高斯（中距精度）+ 近距离高斯（极近距峰值）
 #   - 速度匹配惩罚（0.05m-0.50m smoothstep 门控）：惩罚 |v_drone - v_platform|²
 #   - yaw / yaw_rate / action 平滑惩罚保留
+#   - 保持奖励 + 退款机制鼓励连续稳定跟随
 
 from __future__ import annotations
 
@@ -46,16 +47,19 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     VELOCITY_SCALE_MIN = 0.98   # 速度比例误差下限
     VELOCITY_SCALE_MAX = 1.02   # 速度比例误差上限
 
-    # ── OOB / 成功判定（多方法共享）─────────────────────────────────────────
+    # ── OOB / 训练/评估分数空间（多方法共享）────────────────────────────────
     OOB_HORIZ_DIST = 65.0           # 越界水平距离 (m)，即 130m×130m
-    HOLD_RADIUS = 0.15              # 保持判定水平半径 (m)
-    HOLD_VERT_TOL = 0.10            # 保持判定垂直容差 (m)
-    HOLD_REL_SPEED_MAX = 0.12       # 保持判定最大相对速度 (m/s)
-    TRAIN_SUCCESS_RADIUS = 0.25     # 训练成功水平半径 (m)
-    TRAIN_SUCCESS_VERT_TOL = 0.18   # 训练成功垂直容差 (m)
-    TRAIN_SUCCESS_REL_SPEED_MAX = 0.18  # 训练成功最大相对速度 (m/s)
+
+    TRAIN_SCORE_RADIUS = 0.25       # train_score 水平半径 (m)
+    TRAIN_SCORE_VERT_TOL = 0.20     # train_score 垂直容差 (m)
+    TRAIN_SCORE_REL_SPEED_MAX = 0.18  # train_score 最大相对速度 (m/s)
+
+    EVAL_SCORE_RADIUS = 0.10        # eval_score 水平半径 (m)
+    EVAL_SCORE_VERT_TOL = 0.05      # eval_score 垂直容差 (m)
+    EVAL_SCORE_REL_SPEED_MAX = 0.10  # eval_score 最大相对速度 (m/s)
+
     SUCCESS_SCORE_THRESHOLD = 60.0  # 成功分数阈值 (0-100)
-    OOB_PENALTY = -100.0            # 越界终止惩罚
+    FAILURE_TERMINAL_PENALTY = -500.0  # 越界/坠地/坠毁失败终止惩罚
 
     def __init__(self, env_config, motion=None):
         super().__init__(env_config)
@@ -163,7 +167,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
 
         return noisy
 
-    # ── KF 初始化 ─────────────────────────────────────────────────────────────
+    # ── Episode 指标初始化 ───────────────────────────────────────────────────
 
     def reset_episode_metrics(
         self,
@@ -177,14 +181,18 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         env._stage2_eval_max_hold_steps = 0
         env._stage2_train_possible_steps = self._possible_steps(
             env, drone_state, platform_state,
-            horiz_tol=self.TRAIN_SUCCESS_RADIUS,
-            vert_tol=self.TRAIN_SUCCESS_VERT_TOL,
+            horiz_tol=self.TRAIN_SCORE_RADIUS,
+            vert_tol=self.TRAIN_SCORE_VERT_TOL,
         )
         env._stage2_eval_possible_steps = self._possible_steps(
             env, drone_state, platform_state,
-            horiz_tol=self.HOLD_RADIUS,
-            vert_tol=self.HOLD_VERT_TOL,
+            horiz_tol=self.EVAL_SCORE_RADIUS,
+            vert_tol=self.EVAL_SCORE_VERT_TOL,
         )
+        env._stage2_reward_hold_steps = 0
+        env._stage2_r_hold_total = 0.0
+        env._stage2_hold_refund_steps = 0
+        env._stage2_is_refunding_hold = False
 
     # ── 保持判定 / 成功辅助 ───────────────────────────────────────────────────
 
@@ -206,9 +214,9 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         rel_vel = drone_state["velocity"] - platform_state["velocity"]
         rel_speed = float(np.linalg.norm(rel_vel))
         return (
-            horiz_err < self.HOLD_RADIUS
-            and vert_err < self.HOLD_VERT_TOL
-            and rel_speed < self.HOLD_REL_SPEED_MAX
+            horiz_err < self.EVAL_SCORE_RADIUS
+            and vert_err < self.EVAL_SCORE_VERT_TOL
+            and rel_speed < self.EVAL_SCORE_REL_SPEED_MAX
         )
 
     @staticmethod
@@ -285,9 +293,9 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             drone_state=drone_state,
             platform_state=platform_state,
             target_pos=target_pos,
-            horiz_tol=self.TRAIN_SUCCESS_RADIUS,
-            vert_tol=self.TRAIN_SUCCESS_VERT_TOL,
-            rel_speed_max=self.TRAIN_SUCCESS_REL_SPEED_MAX,
+            horiz_tol=self.TRAIN_SCORE_RADIUS,
+            vert_tol=self.TRAIN_SCORE_VERT_TOL,
+            rel_speed_max=self.TRAIN_SCORE_REL_SPEED_MAX,
         ):
             env._stage2_train_hit_steps = int(
                 getattr(env, "_stage2_train_hit_steps", 0)
@@ -323,8 +331,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     #   1. 三层位置函数：反二次（长尾）+ 高斯（中距精度）+ 超窄高斯（极近距峰值）
     #   2. 速度匹配惩罚：0.05m-0.50m smoothstep 门控，惩罚 |v_drone - v_platform|²
     #   3. yaw / yaw_rate / action 平滑惩罚保留
-    #
-    # 不再需要：交叉门控、velocity_toward、hold退款状态机
+    #   4. 保持奖励 + 退款机制，使用奖励函数内的独立保持空间
 
     def compute_reward(
         self,
@@ -356,21 +363,30 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         POS_APPROACH_WEIGHT = 3.0
         POS_APPROACH_SIGMA_XY = 8.0     # 远距离水平 σ (m)
         POS_APPROACH_SIGMA_Z = 5.0      # 远距离垂直 σ (m)
-        r_approach = POS_APPROACH_WEIGHT / (1.0 + (horiz_err / POS_APPROACH_SIGMA_XY) ** 2 + (vert_err / POS_APPROACH_SIGMA_Z) ** 2)
-        
+        r_approach = POS_APPROACH_WEIGHT / (
+            1.0
+            + (horiz_err / POS_APPROACH_SIGMA_XY) ** 2
+            + (vert_err / POS_APPROACH_SIGMA_Z) ** 2
+        )
+
         # 高斯分量：中距精度
-        POS_PRECISE_WEIGHT = 4.0        # 近距精度权重
+        POS_PRECISE_WEIGHT = 2.0        # 近距精度权重
         POS_PRECISE_SIGMA_XY = 0.8      # 近距水平 σ (m)
         POS_PRECISE_SIGMA_Z = 0.5       # 近距垂直 σ (m)
-        r_precise = POS_PRECISE_WEIGHT * float(np.exp(-(horiz_err ** 2) / (2.0 * POS_PRECISE_SIGMA_XY ** 2) - (vert_err ** 2) / (2.0 * POS_PRECISE_SIGMA_Z ** 2)))
-        
+        r_precise = POS_PRECISE_WEIGHT * float(np.exp(
+            -(horiz_err ** 2) / (2.0 * POS_PRECISE_SIGMA_XY ** 2)
+            - (vert_err ** 2) / (2.0 * POS_PRECISE_SIGMA_Z ** 2)
+        ))
 
         # 高斯分量：极近距峰值
-        POS_PEAK_WEIGHT = 1.5           # 峰值权重
+        POS_PEAK_WEIGHT = 1.0           # 峰值权重
         POS_PEAK_SIGMA_XY = 0.15        # 峰值水平 σ (m)
         POS_PEAK_SIGMA_Z = 0.10         # 峰值垂直 σ (m)
-        r_peak = POS_PEAK_WEIGHT * float(np.exp(-(horiz_err ** 2) / (2.0 * POS_PEAK_SIGMA_XY ** 2) - (vert_err ** 2) / (2.0 * POS_PEAK_SIGMA_Z ** 2)))
-        
+        r_peak = POS_PEAK_WEIGHT * float(np.exp(
+            -(horiz_err ** 2) / (2.0 * POS_PEAK_SIGMA_XY ** 2)
+            - (vert_err ** 2) / (2.0 * POS_PEAK_SIGMA_Z ** 2)
+        ))
+
         # 计算位置奖励总和
         r_pos = r_approach + r_precise + r_peak
 
@@ -378,9 +394,12 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         # gate: 0.05m 全开 → 0.50m 全关
         VEL_MATCH_GATE_INNER = 0.05      # 全开水平误差阈值 (m)
         VEL_MATCH_GATE_OUTER = 0.50      # 全关水平误差阈值 (m)
-        VEL_MATCH_WEIGHT = 1.0           # 速度匹配惩罚权重
+        VEL_MATCH_WEIGHT = 0.50          # 速度匹配惩罚权重
 
-        gate_vm = self._smoothstep((VEL_MATCH_GATE_OUTER - horiz_err) / (VEL_MATCH_GATE_OUTER - VEL_MATCH_GATE_INNER))
+        gate_vm = self._smoothstep(
+            (VEL_MATCH_GATE_OUTER - horiz_err)
+            / (VEL_MATCH_GATE_OUTER - VEL_MATCH_GATE_INNER)
+        )
 
         r_vel_match = -VEL_MATCH_WEIGHT * gate_vm * (rel_speed ** 2)
 
@@ -398,10 +417,78 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         ACTION_SMOOTH_WEIGHT = 0.10   # 动作变化惩罚权重
         ACTION_MAG_WEIGHT = 0.01      # 动作幅值惩罚权重
         action_delta = action - prev_action
-        r_action = (-ACTION_SMOOTH_WEIGHT * float(np.sum(action_delta ** 2)) -ACTION_MAG_WEIGHT * float(np.sum(action ** 2)))
+        r_action = (
+            -ACTION_SMOOTH_WEIGHT * float(np.sum(action_delta ** 2))
+            -ACTION_MAG_WEIGHT * float(np.sum(action ** 2))
+        )
+
+        # ── 保持奖励 + 退款机制 ──
+        # 奖励保持空间独立于 train_score/eval_score 和环境级 hold_steps。
+        HOLD_REWARD_RADIUS = 0.15         # reward/hold 水平半径 (m)
+        HOLD_REWARD_VERT_TOL = 0.10       # reward/hold 垂直容差 (m)
+        HOLD_REWARD_REL_SPEED_MAX = 0.10  # reward/hold 最大相对速度 (m/s)
+        HOLD_BASE_REWARD = 0.05           # 每步保持奖励基数
+        HOLD_CAP_STEPS = 500              # 累积奖励上限步数
+        hold_reward_stable = (
+            horiz_err < HOLD_REWARD_RADIUS
+            and vert_err < HOLD_REWARD_VERT_TOL
+            and rel_speed < HOLD_REWARD_REL_SPEED_MAX
+        )
+        r_hold = 0.0
+        r_hold_break = 0.0
+        if env is not None:
+            env._stage2_reward_hold_steps = int(
+                getattr(env, "_stage2_reward_hold_steps", 0)
+            )
+            env._stage2_r_hold_total = float(
+                getattr(env, "_stage2_r_hold_total", 0.0)
+            )
+            env._stage2_hold_refund_steps = int(
+                getattr(env, "_stage2_hold_refund_steps", 0)
+            )
+            env._stage2_is_refunding_hold = bool(
+                getattr(env, "_stage2_is_refunding_hold", False)
+            )
+
+        if hold_reward_stable:
+            reward_hold_steps = 1
+            if env is not None:
+                env._stage2_reward_hold_steps += 1
+                reward_hold_steps = int(env._stage2_reward_hold_steps)
+                env._stage2_hold_refund_steps = 0
+                env._stage2_is_refunding_hold = False
+            r_hold = HOLD_BASE_REWARD * min(int(reward_hold_steps), HOLD_CAP_STEPS)
+            if env is not None:
+                env._stage2_r_hold_total += float(r_hold)
+        elif env is not None:
+            prev_reward_hold_steps = int(env._stage2_reward_hold_steps)
+            env._stage2_reward_hold_steps = 0
+            if prev_reward_hold_steps > 0:
+                env._stage2_is_refunding_hold = True
+                env._stage2_hold_refund_steps = 0
+                if prev_reward_hold_steps >= HOLD_CAP_STEPS:
+                    r_hold_break -= 10.0
+
+            if env._stage2_is_refunding_hold and env._stage2_r_hold_total > 0.0:
+                env._stage2_hold_refund_steps += 1
+                refund_rate = HOLD_BASE_REWARD * min(
+                    int(env._stage2_hold_refund_steps),
+                    HOLD_CAP_STEPS,
+                )
+                refund = min(float(env._stage2_r_hold_total), float(refund_rate))
+                r_hold_break -= refund
+                env._stage2_r_hold_total -= refund
+
+                if env._stage2_r_hold_total <= 1e-9:
+                    env._stage2_r_hold_total = 0.0
+                    env._stage2_hold_refund_steps = 0
+                    env._stage2_is_refunding_hold = False
 
         # 计算总奖励
-        total = r_pos + r_vel_match + r_yaw + r_yaw_rate + r_action
+        total = (
+            r_pos + r_vel_match + r_yaw + r_yaw_rate
+            + r_action + r_hold + r_hold_break
+        )
 
         info = {
             "reward/pos": r_pos,
@@ -410,6 +497,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "reward/yaw": r_yaw,
             "reward/yaw_rate": r_yaw_rate,
             "reward/action": r_action,
+            "reward/hold": r_hold,
+            "reward/hold_break": r_hold_break,
             "reward/total": total,
             "metric/dist": dist,
             "metric/horiz_err": horiz_err,
@@ -417,6 +506,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "metric/speed": speed,
             "metric/rel_speed": rel_speed,
             "metric/plat_speed": plat_speed,
+            "metric/r_hold_total": float(getattr(env, "_stage2_r_hold_total", 0.0)),
             "metric/gate_vm": gate_vm,
         }
 
@@ -430,8 +520,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         truncated: bool,
         term_info: dict,
     ) -> Tuple[float, bool]:
-        if term_info.get("termination") in {"oob", "below_ground"}:
-            return self.OOB_PENALTY, False
+        if term_info.get("termination") in {"oob", "below_ground", "crashed"}:
+            return self.FAILURE_TERMINAL_PENALTY, False
         if truncated:
             mode = env.get_success_mode() if env is not None else "train"
             score = self._eval_score(env) if mode == "eval" else self._train_score(env)
@@ -445,6 +535,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "timestep", "stage", "reward_total",
             "reward_pos", "reward_peak", "reward_vel_match",
             "reward_yaw", "reward_yaw_rate", "reward_action",
+            "reward_hold", "reward_hold_break",
             "metric_dist", "metric_horiz_err", "metric_vert_err",
             "metric_speed", "metric_rel_speed", "metric_plat_speed",
             "metric_gate_vm",
@@ -461,6 +552,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "reward_yaw": round(info.get("reward/yaw", 0.0), 5),
             "reward_yaw_rate": round(info.get("reward/yaw_rate", 0.0), 5),
             "reward_action": round(info.get("reward/action", 0.0), 5),
+            "reward_hold": round(info.get("reward/hold", 0.0), 5),
+            "reward_hold_break": round(info.get("reward/hold_break", 0.0), 5),
             "metric_dist": round(info.get("metric/dist", 0.0), 4),
             "metric_horiz_err": round(info.get("metric/horiz_err", 0.0), 4),
             "metric_vert_err": round(info.get("metric/vert_err", 0.0), 4),

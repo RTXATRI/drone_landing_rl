@@ -12,7 +12,6 @@
 
 - `dynamics/`：无人机运动学模型、速度指令低通滤波和 PyBullet 预训练扰动。
 - `landing_platform/`：降落平台运动轨迹生成。
-- `rewards/`：策略可复用的奖励分项工具。
 
 ## 分离边界
 

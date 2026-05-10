@@ -57,7 +57,7 @@ def is_hover_stage(stage: int) -> bool:
 
 
 def episode_info_keywords() -> Tuple[str, ...]:
-    return ("success", "episode_stage", "train_score", "eval_score")
+    return ("success", "episode_stage", "train_score", "eval_score", "termination")
 
 
 STAGE_LABELS = {stage: get_stage_label(stage) for stage in registered_stage_ids()}

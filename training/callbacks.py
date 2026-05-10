@@ -234,7 +234,7 @@ class CSVLoggingCallback(BaseCallback):
 
     在 `csv_dir/` 中创建的文件：
       episode_log.csv     — 每个 episode 一行：stage、reward、success
-      reward_log_stageN.csv — 每步一行：各阶段自己的奖励分项和调试指标
+      reward_log_stageN.csv — 可选调试日志，每步一行：各阶段自己的奖励分项和调试指标
       training_log.csv    — 每 `flush_freq` 步一行：loss、ent_coef、lr、fps
     """
 
@@ -248,11 +248,14 @@ class CSVLoggingCallback(BaseCallback):
     ]
 
     def __init__(self, csv_dir: str, flush_freq: int = 2_000,
-                 env_config: EnvConfig = None, verbose: int = 0):
+                 env_config: EnvConfig = None,
+                 reward_step_csv_enabled: bool = False,
+                 verbose: int = 0):
         super().__init__(verbose)
         self.csv_dir    = csv_dir
         self.flush_freq = max(1, int(flush_freq))
         self.env_config = env_config or EnvConfig()
+        self.reward_step_csv_enabled = bool(reward_step_csv_enabled)
 
         os.makedirs(csv_dir, exist_ok=True)
         self._episode_fh = self._train_fh = None
@@ -279,6 +282,10 @@ class CSVLoggingCallback(BaseCallback):
         self._train_fh,   self._train_w   = _open("training_log.csv", self.TRAIN_COLS)
         self._has_written_header = True
         self._next_flush_step = _next_interval_step(self.num_timesteps, self.flush_freq)
+        if self.reward_step_csv_enabled:
+            logger.info("Reward step CSV enabled; reward_log_stageN.csv may become very large.")
+        else:
+            logger.info("Reward step CSV disabled; only episode/training CSV will be written.")
 
     def _strategy_for_stage(self, stage: int):
         stage = int(stage)
@@ -340,7 +347,7 @@ class CSVLoggingCallback(BaseCallback):
                 self._episode_fh.flush()
 
             # 奖励分项行（每个包含奖励 info 的 step）
-            if "reward/total" in info:
+            if self.reward_step_csv_enabled and "reward/total" in info:
                 strategy = self._strategy_for_stage(stage)
                 writer = self._open_reward_writer(stage)
                 row = strategy.reward_log_row(info)

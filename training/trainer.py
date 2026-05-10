@@ -15,46 +15,24 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
-import torch
-from stable_baselines3 import SAC
-from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
 from configs.env_config import EnvConfig
 from configs.train_config import TrainConfig
 from curriculum.curriculum_manager import CurriculumManager, STAGE_SHORT_LABELS
-from curriculum.strategies import create_strategy, episode_info_keywords
-from envs.drone_landing_env import DroneLandingEnv
-from training.callbacks import (
-    CheckpointCallback,
-    CSVLoggingCallback,
-    CurriculumCallback,
-)
+from curriculum.strategies import episode_info_keywords
 from utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import VecMonitor
+    from training.model_selection import BestModelCandidateCallback
 
 logger = logging.getLogger(__name__)
 
 EPISODE_INFO_KEYWORDS = episode_info_keywords()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 环境工厂辅助函数（spawn 模式下必须位于模块顶层以便 pickle）
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _make_env_fn(env_config: EnvConfig, rank: int, seed: int, stage: int):
-    """返回一个创建单个环境实例的闭包。"""
-    def _init():
-        env = DroneLandingEnv(
-            env_config,
-            strategy=create_strategy(stage, env_config),
-        )
-        env.reset(seed=seed + rank)
-        return env
-    set_random_seed(seed + rank)
-    return _init
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,12 +61,15 @@ class Trainer:
         self.resume_path  = resume_path
         self.start_stage  = start_stage
         self.mix_ratio    = float(mix_ratio)
+        self._best_model_cb: Optional["BestModelCandidateCallback"] = None
 
         # 日志设置
         run_dir = os.path.join(train_config.log_dir, train_config.exp_name)
         setup_logger(run_dir)
 
         # 设备解析
+        import torch
+
         if train_config.device == "cuda" and not torch.cuda.is_available():
             logger.warning("CUDA requested but unavailable — falling back to CPU.")
             self.device = "cpu"
@@ -122,21 +103,32 @@ class Trainer:
         # 2. 构建或加载模型
         model = self._build_model(vec_env)
 
-        # 3. 构建课程管理器和回调
+        # 3. 构建课程管理器和 best-model 候选采样器
         curriculum = CurriculumManager(self.cfg.curriculum)
         curriculum.set_stage(self.start_stage)
+        self._build_best_model_callback()
         callbacks = self._build_callbacks(curriculum)
 
         # 4. 按阶段训练；阶段切换由用户手动决定。
         reset_num_timesteps = self.resume_path is None
         try:
             for stage in selected_stages:
+                if vec_env is None:
+                    vec_env = self._build_vec_env(self.cfg.n_envs, stage)
+                    model.set_env(vec_env)
+
                 curriculum.set_stage(stage)
                 stage_obs = self._activate_stage(vec_env, stage)
                 model._last_obs = stage_obs
                 model._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
 
                 stage_steps = self._stage_budget(stage)
+                if self._best_model_cb is not None:
+                    self._best_model_cb.start_stage(
+                        stage=stage,
+                        start_step=int(model.num_timesteps),
+                        stage_budget=stage_steps,
+                    )
                 logger.info("-" * 60)
                 logger.info(
                     f"Stage {stage} {STAGE_SHORT_LABELS[stage]} started | "
@@ -154,7 +146,13 @@ class Trainer:
                 )
                 reset_num_timesteps = False
 
+                if self._best_model_cb is not None:
+                    self._best_model_cb.save_stage_final(stage, model)
                 self._log_stage_finished(curriculum, stage, stage_steps)
+                if self._best_model_cb is not None and vec_env is not None:
+                    vec_env.close()
+                    vec_env = None
+                self._evaluate_best_model_candidates(stage)
                 if stage < self.cfg.curriculum.max_stage:
                     if not self._confirm_next_stage(stage + 1):
                         logger.info("Manual curriculum stopped by user.")
@@ -164,24 +162,31 @@ class Trainer:
         finally:
             self._save_final_model(model)
             curriculum.log_summary()
-            vec_env.close()
+            if vec_env is not None:
+                vec_env.close()
 
     # ── 私有构建函数 ─────────────────────────────────────────────────────────
 
-    def _build_vec_env(self, n_envs: int, stage: int) -> VecMonitor:
+    def _build_vec_env(self, n_envs: int, stage: int) -> "VecMonitor":
+        from stable_baselines3.common.vec_env import VecMonitor
+        from training.env_factory import make_training_env_fn
+        from training.spawn_vec_env import SpawnSafeSubprocVecEnv
+
         logger.info(f"Spawning {n_envs} environment processes (stage {stage})…")
         fns = [
-            _make_env_fn(self.env_cfg, rank=i, seed=self.cfg.seed, stage=stage)
+            make_training_env_fn(self.env_cfg, rank=i, seed=self.cfg.seed, stage=stage)
             for i in range(n_envs)
         ]
         # spawn 可以避免 PyBullet 共享 C 库在 fork 下的相关问题
-        vec_env = SubprocVecEnv(fns, start_method="spawn")
+        vec_env = SpawnSafeSubprocVecEnv(fns, start_method="spawn")
         vec_env = VecMonitor(vec_env, info_keywords=EPISODE_INFO_KEYWORDS)
         logger.info("Environments ready.")
         return vec_env
 
-    def _activate_stage(self, vec_env: VecMonitor, stage: int) -> np.ndarray:
+    def _activate_stage(self, vec_env: "VecMonitor", stage: int) -> np.ndarray:
         """广播手动选择的阶段，并开始一批干净的新 episode。"""
+        from curriculum.strategies import create_strategy
+
         logger.info(f"Activating Stage {stage} {STAGE_SHORT_LABELS[stage]} on all envs.")
         if self.mix_ratio > 0.0 and stage > 1:
             # 预缓存前置课程策略（修复 Bug 3：直接从当前课程启动时前置不存在）
@@ -195,7 +200,9 @@ class Trainer:
         """返回从 1 开始编号的课程阶段对应的配置步数预算。"""
         return int(self.cfg.curriculum.stage_timesteps[stage - 1])
 
-    def _build_model(self, vec_env: VecMonitor) -> SAC:
+    def _build_model(self, vec_env: "VecMonitor") -> "SAC":
+        from stable_baselines3 import SAC
+
         sac = self.cfg.sac
         tb_path = os.path.join(self.cfg.log_dir, self.cfg.exp_name)
 
@@ -234,7 +241,26 @@ class Trainer:
         logger.info(f"Policy parameters: {n_params:,}")
         return model
 
+    def _build_best_model_callback(self) -> None:
+        if self.cfg.best_model_selection_enabled:
+            from training.model_selection import BestModelCandidateCallback
+
+            self._best_model_cb = BestModelCandidateCallback(
+                save_root=os.path.join(self.cfg.model_dir, self.cfg.exp_name),
+                grid_count=self.cfg.best_model_grid_count,
+                interval_top_m=self.cfg.best_model_interval_top_m,
+                verbose=1,
+            )
+        else:
+            self._best_model_cb = None
+
     def _build_callbacks(self, curriculum: CurriculumManager):
+        from training.callbacks import (
+            CheckpointCallback,
+            CSVLoggingCallback,
+            CurriculumCallback,
+        )
+
         n_envs = max(1, int(self.cfg.n_envs))
         curriculum_cb = CurriculumCallback(
             manager=curriculum,
@@ -246,6 +272,7 @@ class Trainer:
             csv_dir=os.path.join(self.cfg.csv_dir, self.cfg.exp_name),
             flush_freq=2_000 * n_envs,
             env_config=self.env_cfg,
+            reward_step_csv_enabled=self.cfg.reward_step_csv_enabled,
             verbose=0,
         )
         ckpt_cb = CheckpointCallback(
@@ -253,7 +280,28 @@ class Trainer:
             save_dir=os.path.join(self.cfg.model_dir, self.cfg.exp_name),
             verbose=1,
         )
-        return [curriculum_cb, csv_cb, ckpt_cb]
+        callbacks = [curriculum_cb, csv_cb, ckpt_cb]
+        if self._best_model_cb is not None:
+            callbacks.append(self._best_model_cb)
+        return callbacks
+
+    def _evaluate_best_model_candidates(self, stage: int) -> None:
+        """阶段正常结束后，对该阶段候选模型进行统一复评。"""
+        if self._best_model_cb is None:
+            return
+        from training.model_selection import evaluate_stage_candidates
+
+        candidates = self._best_model_cb.candidates_for_stage(stage)
+        try:
+            evaluate_stage_candidates(
+                candidates=candidates,
+                stage=stage,
+                env_config=self.env_cfg,
+                train_config=self.cfg,
+                device=self.device,
+            )
+        except Exception:
+            logger.exception("Best-model evaluation failed for stage %s.", stage)
 
     def _log_stage_finished(
         self,
@@ -308,7 +356,7 @@ class Trainer:
                 return False
             logger.info("Please enter Y or N.")
 
-    def _save_final_model(self, model: SAC) -> None:
+    def _save_final_model(self, model: "SAC") -> None:
         """将当前策略保存到约定的 final model 路径。"""
         final_dir = os.path.join(self.cfg.model_dir, self.cfg.exp_name)
         os.makedirs(final_dir, exist_ok=True)

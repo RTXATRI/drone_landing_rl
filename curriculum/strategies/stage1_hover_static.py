@@ -14,15 +14,17 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
     short_label = "Hover-Static"
     episode_metrics = ("train_score", "eval_score")
 
-    # ── 多方法共享参数 ──────────────────────────────────────────────────────
-    HOLD_RADIUS = 0.10              # 保持判定水平半径 (m)
-    HOLD_VERT_TOL = 0.08            # 保持判定垂直容差 (m)
-    HOLD_SPEED_MAX = 0.10           # 保持判定最大速度 (m/s)
-    TRAIN_SUCCESS_RADIUS = 0.20     # 训练成功水平半径 (m)
-    TRAIN_SUCCESS_VERT_TOL = 0.15   # 训练成功垂直容差 (m)
-    TRAIN_SUCCESS_SPEED_MAX = 0.15  # 训练成功最大速度 (m/s)
+    # ── 训练/评估分数空间（多方法共享）──────────────────────────────────────
+    TRAIN_SCORE_RADIUS = 0.20     # train_score 水平半径 (m)
+    TRAIN_SCORE_VERT_TOL = 0.15   # train_score 垂直容差 (m)
+    TRAIN_SCORE_SPEED_MAX = 0.15  # train_score 最大速度 (m/s)
+
+    EVAL_SCORE_RADIUS = 0.10      # eval_score 水平半径 (m)
+    EVAL_SCORE_VERT_TOL = 0.08    # eval_score 垂直容差 (m)
+    EVAL_SCORE_SPEED_MAX = 0.10   # eval_score 最大速度 (m/s)
+
     SUCCESS_SCORE_THRESHOLD = 60.0  # 成功分数阈值 (0-100)
-    OOB_PENALTY = -100.0            # 越界终止惩罚
+    FAILURE_TERMINAL_PENALTY = -500.0  # 越界/坠地/坠毁失败终止惩罚
 
     def stage_id(self) -> int:
         return 1
@@ -48,9 +50,9 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         vert_err = abs(float(target_vec[2]))
         speed = float(np.linalg.norm(drone_state["velocity"]))
         return (
-            horiz_err < self.HOLD_RADIUS
-            and vert_err < self.HOLD_VERT_TOL
-            and speed < self.HOLD_SPEED_MAX
+            horiz_err < self.EVAL_SCORE_RADIUS
+            and vert_err < self.EVAL_SCORE_VERT_TOL
+            and speed < self.EVAL_SCORE_SPEED_MAX
         )
 
     @staticmethod
@@ -111,16 +113,20 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             env,
             drone_state,
             platform_state,
-            horiz_tol=self.TRAIN_SUCCESS_RADIUS,
-            vert_tol=self.TRAIN_SUCCESS_VERT_TOL,
+            horiz_tol=self.TRAIN_SCORE_RADIUS,
+            vert_tol=self.TRAIN_SCORE_VERT_TOL,
         )
         env._stage1_eval_possible_steps = self._possible_steps(
             env,
             drone_state,
             platform_state,
-            horiz_tol=self.HOLD_RADIUS,
-            vert_tol=self.HOLD_VERT_TOL,
+            horiz_tol=self.EVAL_SCORE_RADIUS,
+            vert_tol=self.EVAL_SCORE_VERT_TOL,
         )
+        env._stage1_reward_hold_steps = 0
+        env._stage1_r_hold_total = 0.0
+        env._stage1_hold_refund_steps = 0
+        env._stage1_is_refunding_hold = False
 
     def update_step_metrics(
         self,
@@ -132,9 +138,9 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         if self._state_in_box(
             drone_state=drone_state,
             target_pos=target_pos,
-            horiz_tol=self.TRAIN_SUCCESS_RADIUS,
-            vert_tol=self.TRAIN_SUCCESS_VERT_TOL,
-            speed_max=self.TRAIN_SUCCESS_SPEED_MAX,
+            horiz_tol=self.TRAIN_SCORE_RADIUS,
+            vert_tol=self.TRAIN_SCORE_VERT_TOL,
+            speed_max=self.TRAIN_SCORE_SPEED_MAX,
         ):
             env._stage1_train_hit_steps = int(
                 getattr(env, "_stage1_train_hit_steps", 0)
@@ -280,11 +286,23 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         )
 
         # ── 保持奖励 + 退款机制 ──
-        HOLD_BASE_REWARD = 0.05   # 每步保持奖励基数
-        HOLD_CAP_STEPS = 500      # 累积奖励上限步数
+        # 奖励保持空间独立于 eval_score 使用的环境级 hold_steps。
+        HOLD_REWARD_RADIUS = 0.10     # reward/hold 水平半径 (m)
+        HOLD_REWARD_VERT_TOL = 0.08   # reward/hold 垂直容差 (m)
+        HOLD_REWARD_SPEED_MAX = 0.10  # reward/hold 最大速度 (m/s)
+        HOLD_BASE_REWARD = 0.05       # 每步保持奖励基数
+        HOLD_CAP_STEPS = 500          # 累积奖励上限步数
+        hold_reward_stable = (
+            horiz_err < HOLD_REWARD_RADIUS
+            and vert_err < HOLD_REWARD_VERT_TOL
+            and speed < HOLD_REWARD_SPEED_MAX
+        )
         r_hold = 0.0
         r_hold_break = 0.0
         if env is not None:
+            env._stage1_reward_hold_steps = int(
+                getattr(env, "_stage1_reward_hold_steps", 0)
+            )
             env._stage1_r_hold_total = float(
                 getattr(env, "_stage1_r_hold_total", 0.0)
             )
@@ -295,17 +313,23 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
                 getattr(env, "_stage1_is_refunding_hold", False)
             )
 
-        if hold_steps > 0:
-            r_hold = HOLD_BASE_REWARD * min(int(hold_steps), HOLD_CAP_STEPS)
+        if hold_reward_stable:
+            reward_hold_steps = 1
             if env is not None:
-                env._stage1_r_hold_total += float(r_hold)
+                env._stage1_reward_hold_steps += 1
+                reward_hold_steps = int(env._stage1_reward_hold_steps)
                 env._stage1_hold_refund_steps = 0
                 env._stage1_is_refunding_hold = False
+            r_hold = HOLD_BASE_REWARD * min(int(reward_hold_steps), HOLD_CAP_STEPS)
+            if env is not None:
+                env._stage1_r_hold_total += float(r_hold)
         elif env is not None:
-            if prev_hold_steps > 0:
+            prev_reward_hold_steps = int(env._stage1_reward_hold_steps)
+            env._stage1_reward_hold_steps = 0
+            if prev_reward_hold_steps > 0:
                 env._stage1_is_refunding_hold = True
                 env._stage1_hold_refund_steps = 0
-                if prev_hold_steps >= HOLD_CAP_STEPS:
+                if prev_reward_hold_steps >= HOLD_CAP_STEPS:
                     r_hold_break -= 10.0
 
             if env._stage1_is_refunding_hold and env._stage1_r_hold_total > 0.0:
@@ -359,8 +383,8 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         truncated: bool,
         term_info: dict,
     ) -> Tuple[float, bool]:
-        if term_info.get("termination") in {"oob", "below_ground"}:
-            return self.OOB_PENALTY, False
+        if term_info.get("termination") in {"oob", "below_ground", "crashed"}:
+            return self.FAILURE_TERMINAL_PENALTY, False
         if truncated:
             mode = env.get_success_mode() if env is not None else "train"
             score = self._eval_score(env) if mode == "eval" else self._train_score(env)
