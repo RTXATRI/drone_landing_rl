@@ -16,13 +16,19 @@ class SACConfig:
     buffer_size: int = 3_000_000
     learning_starts: int = 10_000
     batch_size: int = 2048          # 较大的 batch 有利于提高 GPU 利用率
-    tau: float = 0.010
+    tau: float = 0.005
     gamma: float = 0.99
     train_freq: int = 1
-    gradient_steps: int = 8
+    gradient_steps: int = 1
     ent_coef: str = "auto"
     target_update_interval: int = 1
     use_sde: bool = False
+
+    # 学习率三段式衰减：恒定(满LR) → 余弦衰减 → 平坦(最低LR)
+    lr_decay: bool = True                 # 启用学习率衰减
+    lr_decay_start: float = 0.50           # 段1→段2 分界（已完成进度，0.50=完成50%时开始衰减）
+    lr_decay_end: float = 0.80            # 段2→段3 分界（已完成进度，0.80=完成80%时进入平坦）
+    lr_decay_min_ratio: float = 0.2       # 最低 LR 占 learning_rate 的比例
 
     # 网络结构：3 层 MLP，每层 256 个单元
     policy_kwargs: Dict[str, Any] = field(default_factory=lambda: {
@@ -51,7 +57,7 @@ class CurriculumConfig:
     # 已注册课程的预算步数（可通过 CLI --total_steps 覆盖）
     stage_timesteps: List[int] = field(default_factory=lambda: [
         60_000_000,
-        120_000_000,
+        40_000_000,
         30_000_000,
         30_000_000,
     ])
@@ -92,8 +98,8 @@ class TrainConfig:
         4: 50,
     })
     best_model_keep_top_n: int = 5
-    best_model_train_score_weight: float = 0.3
-    best_model_eval_score_weight: float = 0.7
+    best_model_train_score_weight: float = 0.5
+    best_model_eval_score_weight: float = 0.5
 
     # ── 可复现性 ─────────────────────────────────────────────────────────────
     seed: int = 42

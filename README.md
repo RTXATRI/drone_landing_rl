@@ -227,7 +227,7 @@ drone_landing_rl/
 
 每个课程独立定义场景配置、目标点、奖励计算和成功/失败判定。阶段之间由用户手动确认切换（Y/N），不再自动晋级。`--mix_ratio` 支持在后续阶段中穿插一定比例的前一课程回合。
 
-课程策略区分三套空间，默认数值兼容旧行为：`TRAIN_SCORE_*` 用于 `train_score`，`EVAL_SCORE_*` 用于 `eval_score` 和环境级连续保持步数，`compute_reward()` 内的 `HOLD_REWARD_*` 只用于 `reward/hold` 与退款机制。训练/评估参数是多方法共享常量，奖励塑形参数放在对应奖励块附近，方便单独调参；训练和评估模式都会计算同一套 `train_score` / `eval_score`，只是在 episode 成功判定时选择不同分数。
+课程二奖励使用三层位置函数叠加：反二次（长尾，提供远距离梯度）+ 高斯（中距精度）+ 宽高斯（近距峰值，σ_xy=0.30m 提供近距连续梯度），配合 smoothstep 门控的速度匹配惩罚。评分使用 `train_score` / `eval_score` 两套容差空间，分别用于训练信号和严格评估。
 
 > 详见 `curriculum/README.md`
 
@@ -310,6 +310,8 @@ python scripts/export_model.py --model output\models\drone_landing\model_final -
 4. **reward CSV 体积过大**：逐步 reward CSV 每步、每环境写入，长训练可快速增长到 GB 级。后续可考虑采样频率开关或仅在 debug 时启用。
 5. **仿真和真实系统存在 sim-to-real 缺口**：当前 PyBullet 是运动学体模拟，无真实气动/电机/PX4 内环动力学，适合训练高层速度策略。
 6. **策略指标由课程策略声明**：旧实验 `hover_score` 已移除，成功判定和评估字段由各策略独立定义。
+7. **终端惩罚需谨慎设置**：过大的终端惩罚（>-500）会导致 OOB episode 的 TD 误差产生 critic_loss 尖峰，破坏 Q 函数稳定性。推荐 -500 以下，利用正常 episode 的机会成本而非惩罚幅值来阻止 OOB。
+8. **LR 衰减在 resume 时需手动应用**：`SAC.load()` 不会继承 callable learning_rate，需在加载后手动设置 `model.learning_rate = lr_schedule`，否则 LR 冻结在 checkpoint 保存时的固定值。
 
 ## 11. 后续工作
 

@@ -122,6 +122,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best_keep_top_n", type=int,
                    default=defaults.best_model_keep_top_n,
                    help="Number of final top models to keep after best-model evaluation")
+    p.add_argument("--lr_decay", action=argparse.BooleanOptionalAction,
+                   default=defaults.sac.lr_decay,
+                   help="Enable learning rate decay (constant -> cosine -> flat)")
+    p.add_argument("--lr_decay_start", type=float,
+                   default=defaults.sac.lr_decay_start,
+                   help="Training progress to start LR decay (0.0-1.0, e.g. 0.7=70%% done)")
+    p.add_argument("--lr_decay_end", type=float,
+                   default=defaults.sac.lr_decay_end,
+                   help="Training progress to reach min LR (0.0-1.0, e.g. 0.95=95%% done)")
+    p.add_argument("--lr_decay_min_ratio", type=float,
+                   default=defaults.sac.lr_decay_min_ratio,
+                   help="Minimum LR ratio after decay")
     args = p.parse_args()
     if args.max_stage < args.stage:
         p.error("--max_stage must be greater than or equal to --stage")
@@ -133,6 +145,11 @@ def parse_args() -> argparse.Namespace:
         p.error("--best_eval_episodes must be >= 1")
     if args.best_keep_top_n < 1:
         p.error("--best_keep_top_n must be >= 1")
+    if args.lr_decay:
+        if not (0.0 < args.lr_decay_start < args.lr_decay_end <= 1.0):
+            p.error("--lr_decay_start must be in (0, --lr_decay_end) and --lr_decay_end in (0, 1]")
+        if not (0.0 < args.lr_decay_min_ratio < 1.0):
+            p.error("--lr_decay_min_ratio must be in (0, 1)")
     unknown_best_eval_stages = sorted(set(args.best_eval_envs) - set(stage_ids))
     if unknown_best_eval_stages:
         p.error(f"--best_eval_envs contains unknown stages: {unknown_best_eval_stages}")
@@ -156,6 +173,10 @@ def main() -> None:
     sac_cfg = SACConfig(
         learning_rate = args.lr,
         batch_size = args.batch_size,
+        lr_decay = args.lr_decay,
+        lr_decay_start = args.lr_decay_start,
+        lr_decay_end = args.lr_decay_end,
+        lr_decay_min_ratio = args.lr_decay_min_ratio,
     )
 
     cur_cfg = CurriculumConfig(max_stage = args.max_stage)

@@ -201,10 +201,35 @@ class Trainer:
         return int(self.cfg.curriculum.stage_timesteps[stage - 1])
 
     def _build_model(self, vec_env: "VecMonitor") -> "SAC":
+        import math
         from stable_baselines3 import SAC
 
         sac = self.cfg.sac
         tb_path = os.path.join(self.cfg.log_dir, self.cfg.exp_name)
+
+        # 学习率调度：三段式（恒定→余弦→平坦）
+        if sac.lr_decay:
+            base_lr = sac.learning_rate
+            decay_start = sac.lr_decay_start
+            decay_end = sac.lr_decay_end
+            min_ratio = sac.lr_decay_min_ratio
+
+            def lr_schedule(progress_remaining: float) -> float:
+                progress = 1.0 - progress_remaining  # 转换为已完成进度
+                if progress <= decay_start:
+                    return base_lr                    # 段1: 恒定
+                if progress >= decay_end:
+                    return base_lr * min_ratio        # 段3: 平坦
+                t = (progress - decay_start) / (decay_end - decay_start)
+                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t))
+                return base_lr * (min_ratio + (1.0 - min_ratio) * cosine_factor)  # 段2: 余弦
+
+            logger.info(
+                f"LR decay enabled: constant until {decay_start:.0%} done, "
+                f"cosine to {min_ratio:.0%} at {decay_end:.0%} done"
+            )
+        else:
+            lr_schedule = sac.learning_rate
 
         if self.resume_path and os.path.exists(self.resume_path + ".zip"):
             logger.info(f"Resuming from {self.resume_path}.zip")
@@ -214,12 +239,15 @@ class Trainer:
                 device=self.device,
                 tensorboard_log=tb_path,
             )
+            if sac.lr_decay:
+                model.learning_rate = lr_schedule
+                logger.info("Applied LR decay schedule to resumed model.")
         else:
             logger.info("Initializing new SAC model…")
             model = SAC(
                 policy="MlpPolicy",
                 env=vec_env,
-                learning_rate=sac.learning_rate,
+                learning_rate=lr_schedule,
                 buffer_size=sac.buffer_size,
                 learning_starts=sac.learning_starts,
                 batch_size=sac.batch_size,

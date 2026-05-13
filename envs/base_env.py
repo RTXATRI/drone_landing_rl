@@ -289,12 +289,12 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         self._reset_simulation(rng)
 
         drone_state = self._get_drone_state()
-        platform_state = self._get_platform_state()
-        platform_state = self.strategy.process_platform_state(platform_state, rng)
-        self._platform_state_filtered = platform_state
+        platform_state_raw = self._get_platform_state()
+        platform_state_obs = self.strategy.process_platform_state(platform_state_raw, rng)
+        self._platform_state_filtered = platform_state_obs
         self._reset_hold_tracking()
-        self.strategy.reset_episode_metrics(self, drone_state, platform_state)
-        obs = self._build_observation(drone_state, platform_state)
+        self.strategy.reset_episode_metrics(self, drone_state, platform_state_raw)
+        obs = self._build_observation(drone_state, platform_state_obs)
         return obs, {}
 
     def step(self, action: np.ndarray):
@@ -315,22 +315,22 @@ class BaseDroneLandingEnv(gym.Env, ABC):
 
         # 2. 观测新状态
         drone_state = self._get_drone_state()
-        platform_state = self._get_platform_state()
-        platform_state = self.strategy.process_platform_state(
-            platform_state, getattr(self, "_rng", None),
+        platform_state_raw = self._get_platform_state()
+        platform_state_obs = self.strategy.process_platform_state(
+            platform_state_raw, getattr(self, "_rng", None),
         )
-        self._platform_state_filtered = platform_state
+        self._platform_state_filtered = platform_state_obs
 
         # 3. 计算观测
-        obs = self._build_observation(drone_state, platform_state)
+        obs = self._build_observation(drone_state, platform_state_obs)
 
         # 4. 当活动策略使用悬停评分时，跟踪悬停保持步数
         prev_hold_steps = self._hover_hold_steps
         if self.strategy.is_hover_stage():
-            target = self._get_target_pos(platform_state["position"])
+            target = self._get_target_pos(platform_state_raw["position"])
             if self.strategy.is_hold_stable(
                 drone_state=drone_state,
-                platform_state=platform_state,
+                platform_state=platform_state_raw,
                 target_pos=target,
             ):
                 self._hover_hold_steps += 1
@@ -343,16 +343,16 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         self.strategy.update_step_metrics(
             self,
             drone_state,
-            platform_state,
-            self._get_target_pos(platform_state["position"]),
+            platform_state_raw,
+            self._get_target_pos(platform_state_raw["position"]),
         )
 
         # 5. 计算稠密奖励
-        target_pos = self._get_target_pos(platform_state["position"])
+        target_pos = self._get_target_pos(platform_state_raw["position"])
         reward, reward_info = self.strategy.compute_reward(
             env=self,
             drone_state=drone_state,
-            platform_state=platform_state,
+            platform_state=platform_state_raw,
             action=action,
             prev_action=self._prev_action,
             target_pos=target_pos,
@@ -361,7 +361,7 @@ class BaseDroneLandingEnv(gym.Env, ABC):
         )
 
         # 6. 检查终止条件
-        terminated, term_info = self._check_termination(drone_state, platform_state)
+        terminated, term_info = self._check_termination(drone_state, platform_state_raw)
 
         truncated = self._step_count >= self.config.episode.max_steps
 
