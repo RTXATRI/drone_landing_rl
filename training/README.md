@@ -125,7 +125,7 @@ conda run --no-capture-output -n drone_rl tensorboard --logdir output/logs
 | `reward/action` | 动作平滑和幅值惩罚 |
 | `metric/horiz_err` / `metric/vert_err` | 目标水平/垂直误差 |
 | `metric/rel_speed` / `metric/plat_speed` | Stage 2 相对速度和平台速度 |
-| `metric/gate_vm` | Stage 2 速度匹配门控 |
+| `metric/gate_xy` | Stage 2 水平速度匹配门控 |
 | `metric/wind_speed` | 当前总水平风速大小 |
 | `metric/base_wind_speed` | 当前 episode 固定弱漂移大小 |
 | `metric/gust_speed` | 当前阵风速度大小 |

@@ -67,14 +67,11 @@ def _episode_value(info: dict, episode_info: dict, key: str, default):
     return info.get(key, default)
 
 
-def _episode_stage(info: dict, episode_info: dict) -> int:
+def _info_stage(info: dict, episode_info: dict) -> int:
     """返回 episode 或逐步奖励行对应的阶段。"""
-    if episode_info is not None:
-        if "episode_stage" in episode_info:
-            return int(episode_info.get("episode_stage", 0))
-        if "stage" in episode_info:
-            return int(episode_info.get("stage", 0))
-    return int(info.get("episode_stage", info.get("stage", 0)))
+    if episode_info is not None and "stage" in episode_info:
+        return int(episode_info.get("stage", 0))
+    return int(info.get("stage", 0))
 
 
 def _next_interval_step(current_step: int, interval: int) -> int:
@@ -134,7 +131,7 @@ class CurriculumCallback(BaseCallback):
         for info in self.locals.get("infos", []):
             ep = info.get("episode")
             if ep is not None:
-                ep_stage = _episode_stage(info, ep)
+                ep_stage = _info_stage(info, ep)
                 self._total_count += 1
                 # 穿插训练的混合回合不记入滚动窗口（修复 Bug 4）
                 if ep_stage != self.manager.current_stage:
@@ -329,7 +326,7 @@ class CSVLoggingCallback(BaseCallback):
 
         for info in self.locals.get("infos", []):
             ep = info.get("episode")
-            stage = _episode_stage(info, ep)
+            stage = _info_stage(info, ep)
 
             # 回合行
             if ep is not None and self._episode_w:

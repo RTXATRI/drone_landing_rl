@@ -55,13 +55,10 @@ class EvaluatedModel:
     final_path: str
 
 
-def _episode_stage(info: dict, episode_info: Optional[dict]) -> int:
-    if episode_info is not None:
-        if "episode_stage" in episode_info:
-            return int(episode_info.get("episode_stage", 0))
-        if "stage" in episode_info:
-            return int(episode_info.get("stage", 0))
-    return int(info.get("episode_stage", info.get("stage", 0)))
+def _info_stage(info: dict, episode_info: Optional[dict]) -> int:
+    if episode_info is not None and "stage" in episode_info:
+        return int(episode_info.get("stage", 0))
+    return int(info.get("stage", 0))
 
 
 def _safe_score(value: float) -> str:
@@ -293,7 +290,7 @@ class BestModelCandidateCallback(BaseCallback):
             ep = info.get("episode")
             if ep is None:
                 continue
-            ep_stage = _episode_stage(info, ep)
+            ep_stage = _info_stage(info, ep)
             if ep_stage != self._stage:
                 continue
             ts = int(self.num_timesteps)

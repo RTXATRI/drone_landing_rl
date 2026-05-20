@@ -85,7 +85,6 @@ def build_configs_random(params: list, n_trials: int) -> list:
 
 PARAM_TO_FLAG = {
     "cmd_filter_alpha": None,       # env config 中的参数，暂无直接 CLI flag
-    "k_smooth":         None,       # env config
     "lr":               "--lr",
     "learning_rate":    "--lr",
     "batch_size":       "--batch_size",

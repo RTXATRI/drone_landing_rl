@@ -17,11 +17,12 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
     # ── 训练/评估分数空间（多方法共享）──────────────────────────────────────
     TRAIN_SCORE_RADIUS = 0.20     # train_score 水平半径 (m)
     TRAIN_SCORE_VERT_TOL = 0.15   # train_score 垂直容差 (m)
-    TRAIN_SCORE_SPEED_MAX = 0.15  # train_score 最大速度 (m/s)
+    TRAIN_SCORE_HORIZ_SPEED_MAX = 0.15  # train_score 最大水平速度 (m/s)
 
     EVAL_SCORE_RADIUS = 0.10      # eval_score 水平半径 (m)
     EVAL_SCORE_VERT_TOL = 0.08    # eval_score 垂直容差 (m)
-    EVAL_SCORE_SPEED_MAX = 0.10   # eval_score 最大速度 (m/s)
+    EVAL_SCORE_HORIZ_SPEED_MAX = 0.10   # eval_score 最大水平速度 (m/s)
+    SCORE_VERT_SPEED_MAX = 0.05   # train/eval 最大垂直速度 (m/s)
 
     SUCCESS_SCORE_THRESHOLD = 60.0  # 成功分数阈值 (0-100)
     FAILURE_TERMINAL_PENALTY = -500.0  # 越界/坠地/坠毁失败终止惩罚
@@ -48,27 +49,37 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         target_vec = target_pos - drone_state["position"]
         horiz_err = float(np.linalg.norm(target_vec[:2]))
         vert_err = abs(float(target_vec[2]))
-        speed = float(np.linalg.norm(drone_state["velocity"]))
+        velocity = drone_state["velocity"]
+        horiz_speed = float(np.linalg.norm(velocity[:2]))
+        vert_speed = abs(float(velocity[2]))
         return (
             horiz_err < self.EVAL_SCORE_RADIUS
             and vert_err < self.EVAL_SCORE_VERT_TOL
-            and speed < self.EVAL_SCORE_SPEED_MAX
+            and horiz_speed < self.EVAL_SCORE_HORIZ_SPEED_MAX
+            and vert_speed < self.SCORE_VERT_SPEED_MAX
         )
 
-    @staticmethod
     def _state_in_box(
+        self,
         *,
         drone_state: Dict[str, np.ndarray],
         target_pos: np.ndarray,
         horiz_tol: float,
         vert_tol: float,
-        speed_max: float,
+        horiz_speed_max: float,
     ) -> bool:
         target_vec = target_pos - drone_state["position"]
         horiz_err = float(np.linalg.norm(target_vec[:2]))
         vert_err = abs(float(target_vec[2]))
-        speed = float(np.linalg.norm(drone_state["velocity"]))
-        return horiz_err < horiz_tol and vert_err < vert_tol and speed < speed_max
+        velocity = drone_state["velocity"]
+        horiz_speed = float(np.linalg.norm(velocity[:2]))
+        vert_speed = abs(float(velocity[2]))
+        return (
+            horiz_err < horiz_tol
+            and vert_err < vert_tol
+            and horiz_speed < horiz_speed_max
+            and vert_speed < self.SCORE_VERT_SPEED_MAX
+        )
 
     def _possible_steps(
         self,
@@ -140,7 +151,7 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             target_pos=target_pos,
             horiz_tol=self.TRAIN_SCORE_RADIUS,
             vert_tol=self.TRAIN_SCORE_VERT_TOL,
-            speed_max=self.TRAIN_SCORE_SPEED_MAX,
+            horiz_speed_max=self.TRAIN_SCORE_HORIZ_SPEED_MAX,
         ):
             env._stage1_train_hit_steps = int(
                 getattr(env, "_stage1_train_hit_steps", 0)
@@ -213,22 +224,23 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             * float(np.exp(-(vert_err ** 2) / (2.0 * POS_Z_SIGMA ** 2)))
         )
 
-        # ── 速度惩罚：vel_gate 控制强度，远距=0 近距=1 ──
+        # ── 速度惩罚：近距门控控制强度，远距=0 近距=1 ──
         VEL_WEIGHT = 0.20
         VEL_GATE_XY_INNER = 0.25   # 全惩罚内阈值 (m)
         VEL_GATE_XY_OUTER = 0.75   # 零惩罚外阈值 (m)
         VEL_GATE_Z_INNER = 0.20
         VEL_GATE_Z_OUTER = 0.60
-        g_xy = self._smoothstep(
+        gate_xy = self._smoothstep(
             (VEL_GATE_XY_OUTER - horiz_err)
             / (VEL_GATE_XY_OUTER - VEL_GATE_XY_INNER)
         )
-        g_z = self._smoothstep(
+        gate_z = self._smoothstep(
             (VEL_GATE_Z_OUTER - vert_err)
             / (VEL_GATE_Z_OUTER - VEL_GATE_Z_INNER)
         )
-        vel_gate = float(g_xy * g_z)
-        r_vel = -VEL_WEIGHT * vel_gate * float(np.dot(drone_vel, drone_vel))
+        gate_near_3d = float(gate_xy * gate_z)
+        gate_vel = gate_near_3d
+        r_vel = -VEL_WEIGHT * gate_vel * float(np.dot(drone_vel, drone_vel))
 
         # ── 偏航角惩罚 ──
         YAW_WEIGHT = 0.20
@@ -271,10 +283,12 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
         YAW_RATE_WEIGHT = 0.05
         yaw_inner = 0.10
         yaw_outer = 0.50
-        yaw_gate = self._smoothstep((yaw_outer - abs(yaw)) / (yaw_outer - yaw_inner))
-        yaw_rate_gate = float(vel_gate * yaw_gate)
+        gate_yaw_angle = self._smoothstep(
+            (yaw_outer - abs(yaw)) / (yaw_outer - yaw_inner)
+        )
+        gate_yaw_rate = float(gate_near_3d * gate_yaw_angle)
         yaw_rate = float(drone_state["yaw_rate"])
-        r_yaw_rate = -YAW_RATE_WEIGHT * yaw_rate_gate * yaw_rate ** 2
+        r_yaw_rate = -YAW_RATE_WEIGHT * gate_yaw_rate * yaw_rate ** 2
 
         # ── 动作平滑和幅值惩罚 ──
         ACTION_SMOOTH_WEIGHT = 0.10   # 动作变化惩罚权重
@@ -369,8 +383,10 @@ class Stage1HoverStaticStrategy(HoverStrategyMixin, CurriculumStrategy):
             "metric/r_hold_total": float(getattr(env, "_stage1_r_hold_total", 0.0)),
             "metric/velocity_toward_cos": velocity_toward_cos,
             "metric/velocity_toward_weight": velocity_toward_weight,
-            "metric/vel_gate": vel_gate,
-            "metric/yaw_rate_gate": yaw_rate_gate,
+            "metric/gate_near_3d": gate_near_3d,
+            "metric/gate_vel": gate_vel,
+            "metric/gate_yaw_angle": gate_yaw_angle,
+            "metric/gate_yaw_rate": gate_yaw_rate,
         }
 
         return float(total), info

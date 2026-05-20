@@ -123,10 +123,11 @@ class Trainer:
                 model._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
 
                 stage_steps = self._stage_budget(stage)
+                stage_start_step = int(model.num_timesteps)
                 if self._best_model_cb is not None:
                     self._best_model_cb.start_stage(
                         stage=stage,
-                        start_step=int(model.num_timesteps),
+                        start_step=stage_start_step,
                         stage_budget=stage_steps,
                     )
                 logger.info("-" * 60)
@@ -135,6 +136,13 @@ class Trainer:
                     f"budget={stage_steps:,} timesteps"
                 )
                 logger.info("-" * 60)
+
+                self._apply_stage_lr_schedule(
+                    model,
+                    stage=stage,
+                    stage_start_step=stage_start_step,
+                    stage_budget=stage_steps,
+                )
 
                 model.learn(
                     total_timesteps = stage_steps,
@@ -200,36 +208,75 @@ class Trainer:
         """返回从 1 开始编号的课程阶段对应的配置步数预算。"""
         return int(self.cfg.curriculum.stage_timesteps[stage - 1])
 
-    def _build_model(self, vec_env: "VecMonitor") -> "SAC":
+    def _make_lr_schedule(self, *, stage_start_step: int, stage_budget: int):
+        """构造按当前课程阶段局部进度计算的学习率调度函数。"""
         import math
+
+        sac = self.cfg.sac
+        base_lr = float(sac.learning_rate)
+        decay_start = float(sac.lr_decay_start)
+        decay_end = float(sac.lr_decay_end)
+        min_ratio = float(sac.lr_decay_min_ratio)
+        stage_start_step = int(stage_start_step)
+        stage_budget = max(1, int(stage_budget))
+        stage_end_step = stage_start_step + stage_budget
+
+        def lr_schedule(progress_remaining: float) -> float:
+            current_global = (1.0 - float(progress_remaining)) * float(stage_end_step)
+            stage_progress = (
+                (current_global - float(stage_start_step)) / float(stage_budget)
+            )
+            stage_progress = float(np.clip(stage_progress, 0.0, 1.0))
+
+            if stage_progress <= decay_start:
+                return base_lr
+            if stage_progress >= decay_end:
+                return base_lr * min_ratio
+            t = (stage_progress - decay_start) / (decay_end - decay_start)
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t))
+            return base_lr * (min_ratio + (1.0 - min_ratio) * cosine_factor)
+
+        return lr_schedule
+
+    def _apply_stage_lr_schedule(
+        self,
+        model: "SAC",
+        *,
+        stage: int,
+        stage_start_step: int,
+        stage_budget: int,
+    ) -> None:
+        """将当前阶段局部学习率调度应用到 SB3 模型和 optimizer。"""
+        sac = self.cfg.sac
+
+        if sac.lr_decay:
+            lr_schedule = self._make_lr_schedule(
+                stage_start_step=stage_start_step,
+                stage_budget=stage_budget,
+            )
+            model.learning_rate = lr_schedule
+            model._setup_lr_schedule()
+
+            logger.info(
+                f"Applied stage-local LR schedule: stage={stage}, "
+                f"start={stage_start_step:,}, budget={stage_budget:,}"
+            )
+        else:
+            model.learning_rate = sac.learning_rate
+            model._setup_lr_schedule()
+
+    def _build_model(self, vec_env: "VecMonitor") -> "SAC":
         from stable_baselines3 import SAC
 
         sac = self.cfg.sac
         tb_path = os.path.join(self.cfg.log_dir, self.cfg.exp_name)
 
-        # 学习率调度：三段式（恒定→余弦→平坦）
         if sac.lr_decay:
-            base_lr = sac.learning_rate
-            decay_start = sac.lr_decay_start
-            decay_end = sac.lr_decay_end
-            min_ratio = sac.lr_decay_min_ratio
-
-            def lr_schedule(progress_remaining: float) -> float:
-                progress = 1.0 - progress_remaining  # 转换为已完成进度
-                if progress <= decay_start:
-                    return base_lr                    # 段1: 恒定
-                if progress >= decay_end:
-                    return base_lr * min_ratio        # 段3: 平坦
-                t = (progress - decay_start) / (decay_end - decay_start)
-                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t))
-                return base_lr * (min_ratio + (1.0 - min_ratio) * cosine_factor)  # 段2: 余弦
-
             logger.info(
-                f"LR decay enabled: constant until {decay_start:.0%} done, "
-                f"cosine to {min_ratio:.0%} at {decay_end:.0%} done"
+                f"LR decay enabled: constant until {sac.lr_decay_start:.0%} done, "
+                f"cosine to {sac.lr_decay_min_ratio:.0%} at "
+                f"{sac.lr_decay_end:.0%} done (stage-local)"
             )
-        else:
-            lr_schedule = sac.learning_rate
 
         if self.resume_path and os.path.exists(self.resume_path + ".zip"):
             logger.info(f"Resuming from {self.resume_path}.zip")
@@ -239,15 +286,12 @@ class Trainer:
                 device=self.device,
                 tensorboard_log=tb_path,
             )
-            if sac.lr_decay:
-                model.learning_rate = lr_schedule
-                logger.info("Applied LR decay schedule to resumed model.")
         else:
             logger.info("Initializing new SAC model…")
             model = SAC(
                 policy="MlpPolicy",
                 env=vec_env,
-                learning_rate=lr_schedule,
+                learning_rate=sac.learning_rate,
                 buffer_size=sac.buffer_size,
                 learning_starts=sac.learning_starts,
                 batch_size=sac.batch_size,
@@ -350,10 +394,10 @@ class Trainer:
         summary_fields = [
             f"SuccessRate{sr_window}: {curriculum.rolling_success_rate():.1%}",
         ]
-        if "stage1_train_score" in curriculum.current_episode_metric_keys():
+        if "train_score" in curriculum.current_episode_metric_keys():
             summary_fields.append(
                 f"AvgTrainScore{sr_window}: "
-                f"{curriculum.rolling_metric('stage1_train_score'):.1f}"
+                f"{curriculum.rolling_metric('train_score'):.1f}"
             )
         summary_fields.extend([
             f"AvgLen{sr_window}: {curriculum.rolling_avg_length():.0f}",

@@ -87,8 +87,6 @@ if ~SHOW_FIG, close(fig1); end
 %% ── 图 2：成功率 ─────────────────────────────────────────────────────────
 fig2 = figure('Name', 'Success Rate', 'Position', [100 100 1000 400]);
 hold on; grid on;
-yline(0.8, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1.2, ...
-      'DisplayName', 'Advance threshold (80%)');
 
 for s = 1:4
     mask = EP.stage == s;

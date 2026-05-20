@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# 功能：可视化课程一、二的位置相关奖励函数 3D 地形图。
+# 功能：可视化课程一、二的位置相关奖励函数 3D 地形图和 2D 切片图。
 """
-奖励函数 3D 可视化：位置奖励地形图。
+奖励函数可视化：位置奖励地形图和切片图。
 
 修改脚本顶部的 STAGE / VIEW 配置即可选择显示内容。
-支持鼠标拖拽旋转 + 滚轮缩放。
+3D 图支持鼠标拖拽旋转 + 滚轮缩放。
 """
 
 import numpy as np
@@ -87,22 +87,26 @@ def stage1_vel_gate(h, v):
 # ══════════════════════════════════════════════════════════════════
 
 # ── r_approach：反二次（长尾） ──
-POS_APPROACH_WEIGHT   = 3.0   # 峰值权重
+POS_APPROACH_WEIGHT   = 2.5   # 峰值权重
 POS_APPROACH_SIGMA_XY = 8.0   # 水平半衰半径 (m)
-POS_APPROACH_SIGMA_Z  = 5.0   # 垂直半衰半径 (m)
+POS_APPROACH_SIGMA_Z  = 8.0   # 垂直半衰半径 (m)
 
 # ── r_precise：高斯（中距精度） ──
-POS_PRECISE_WEIGHT   = 4.0    # 近距精度权重
-POS_PRECISE_SIGMA_XY = 0.9    # 近距水平 σ (m)
-POS_PRECISE_SIGMA_Z  = 0.5    # 近距垂直 σ (m)
+POS_PRECISE_WEIGHT   = 1.5    # 近距精度权重
+POS_PRECISE_SIGMA_XY = 1.0    # 近距水平 σ (m)
+POS_PRECISE_SIGMA_Z  = 1.0    # 近距垂直 σ (m)
 
 # ── r_peak：窄高斯（近距峰值） ──
-POS_PEAK_WEIGHT   = 2.0       # 峰值权重
-POS_PEAK_SIGMA_XY = 0.15      # 峰值水平 σ (m)
-POS_PEAK_SIGMA_Z  = 0.10      # 峰值垂直 σ (m)
+POS_PEAK_WEIGHT   = 1.0       # 峰值权重
+POS_PEAK_SIGMA_XY = 0.25      # 峰值水平 σ (m)
+POS_PEAK_SIGMA_Z  = 0.25      # 峰值垂直 σ (m)
+
+POS_PEAK_WEIGHT2   = 0.5       # 峰值权重
+POS_PEAK_SIGMA_XY2 = 0.04      # 峰值水平 σ (m)
+POS_PEAK_SIGMA_Z2  = 0.04      # 峰值垂直 σ (m)
 
 # ── vel_match gate ──
-VEL_MATCH_GATE_INNER = 0.15   # 全惩罚内阈值 (m)
+VEL_MATCH_GATE_INNER = 0.10   # 全惩罚内阈值 (m)
 VEL_MATCH_GATE_OUTER = 0.50   # 零惩罚外阈值 (m)
 
 
@@ -123,6 +127,12 @@ def stage2_r_peak(h, v):
     return POS_PEAK_WEIGHT * np.exp(
         -(h ** 2) / (2.0 * POS_PEAK_SIGMA_XY ** 2)
         - (v ** 2) / (2.0 * POS_PEAK_SIGMA_Z ** 2)
+    )
+
+def stage2_r_peak_2(h, v):
+    return POS_PEAK_WEIGHT2 * np.exp(
+        -(h ** 2) / (2.0 * POS_PEAK_SIGMA_XY2 ** 2)
+        - (v ** 2) / (2.0 * POS_PEAK_SIGMA_Z2 ** 2)
     )
 
 def stage2_r_pos_total(h, v):
@@ -153,6 +163,8 @@ STAGE_CONFIGS = {
         "cmap": "viridis",
         "near_range": 3.0,
         "far_range": 10.0,
+        "horiz_marks": (0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
+        "vert_marks": (0.01, 0.03, 0.05, 0.08, 0.10, 0.20),
     },
 }
 
@@ -162,6 +174,7 @@ STAGE_CONFIGS = {
 # ══════════════════════════════════════════════════════════════════
 
 GRID_RES = 100
+SLICE_RES = 500
 
 
 def plot_stage(config, view):
@@ -193,6 +206,78 @@ def plot_stage(config, view):
     fig.canvas.mpl_connect("scroll_event", _on_scroll)
 
 
+def _slice_views(config, view):
+    """二维切片范围：both 同时显示近距和远距。"""
+    if view == "near":
+        return [("Near", config["near_range"])]
+    if view == "far":
+        return [("Far", config["far_range"])]
+    return [
+        ("Near", config["near_range"]),
+        ("Far", config["far_range"]),
+    ]
+
+
+def _add_reference_lines(ax, marks):
+    """为 Stage 2 切片图添加关键误差参考线。"""
+    x_min, x_max = ax.get_xlim()
+    for mark in marks:
+        if x_min <= mark <= x_max:
+            ax.axvline(mark, color="gray", linestyle=":", linewidth=0.8, alpha=0.45)
+            ax.text(
+                mark,
+                0.98,
+                f"{mark:g}",
+                transform=ax.get_xaxis_transform(),
+                rotation=90,
+                ha="right",
+                va="top",
+                fontsize=8,
+                color="gray",
+            )
+
+
+def plot_stage_slices(config, view):
+    """绘制 r_pos(h, 0) 与 r_pos(0, v) 两张二维切片图。"""
+    views = _slice_views(config, view)
+    nrows = len(views)
+    fig, axes = plt.subplots(nrows, 2, figsize=(14, 5 * nrows), squeeze=False)
+    fig.suptitle(
+        f'{config["label"]} — r_pos 2D slices',
+        fontsize=13,
+    )
+
+    for row, (view_name, max_range) in enumerate(views):
+        err = np.linspace(0.0, max_range, SLICE_RES)
+        zeros = np.zeros_like(err)
+        horiz_slice = config["func"](err, zeros)
+        vert_slice = config["func"](zeros, err)
+
+        ax_h = axes[row, 0]
+        ax_h.plot(err, horiz_slice, color="tab:blue", linewidth=2.0)
+        ax_h.set_xlabel("horiz_err (m), vert_err = 0")
+        ax_h.set_ylabel("Reward")
+        ax_h.set_title(
+            f"Horizontal slice: r_pos(h, 0), {view_name} 0–{max_range:.0f}m",
+            fontsize=10,
+        )
+        ax_h.grid(True, alpha=0.3)
+        _add_reference_lines(ax_h, config.get("horiz_marks", ()))
+
+        ax_v = axes[row, 1]
+        ax_v.plot(err, vert_slice, color="tab:orange", linewidth=2.0)
+        ax_v.set_xlabel("vert_err (m), horiz_err = 0")
+        ax_v.set_ylabel("Reward")
+        ax_v.set_title(
+            f"Vertical slice: r_pos(0, v), {view_name} 0–{max_range:.0f}m",
+            fontsize=10,
+        )
+        ax_v.grid(True, alpha=0.3)
+        _add_reference_lines(ax_v, config.get("vert_marks", ()))
+
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+
+
 # ══════════════════════════════════════════════════════════════════
 # 入口
 # ══════════════════════════════════════════════════════════════════
@@ -210,6 +295,7 @@ def main():
     for sid in stages:
         print(f"Stage {sid}: {STAGE_CONFIGS[sid]['label']}")
         plot_stage(STAGE_CONFIGS[sid], VIEW)
+        plot_stage_slices(STAGE_CONFIGS[sid], VIEW)
 
     plt.show()
 

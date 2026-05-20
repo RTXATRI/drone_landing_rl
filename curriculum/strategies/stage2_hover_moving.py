@@ -6,8 +6,9 @@
 #   - 3 种运动模式池随机选择
 #
 # 奖励设计：
-#   - 三层位置函数：反二次（长尾）+ 高斯（中距精度）+ 宽高斯（近距连续梯度）
-#   - 速度匹配惩罚（0.15m-0.50m smoothstep 门控）：惩罚 |v_drone - v_platform|²
+#   - 三层位置函数：反二次（长尾）+ 高斯（中距精度）+ 窄高斯（厘米级梯度）
+#   - 远距相对闭合速度奖励：鼓励相对平台朝目标移动，抑制初始外逃
+#   - 速度匹配惩罚：三轴误差修正速度模型，允许位置误差收敛速度
 #   - yaw / yaw_rate / action 平滑惩罚保留
 
 from __future__ import annotations
@@ -50,12 +51,18 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     OOB_HORIZ_DIST = 65.0           # 越界水平距离 (m)，即 130m×130m
 
     TRAIN_SCORE_RADIUS = 0.25       # train_score 水平半径 (m)
-    TRAIN_SCORE_VERT_TOL = 0.20     # train_score 垂直容差 (m)
-    TRAIN_SCORE_REL_SPEED_MAX = 0.18  # train_score 最大相对速度 (m/s)
+    TRAIN_SCORE_VERT_TOL = 0.15     # train_score 垂直容差 (m)
 
     EVAL_SCORE_RADIUS = 0.10        # eval_score 水平半径 (m)
     EVAL_SCORE_VERT_TOL = 0.05      # eval_score 垂直容差 (m)
-    EVAL_SCORE_REL_SPEED_MAX = 0.10  # eval_score 最大相对速度 (m/s)
+
+    EVAL_SCORE_MISS_RESET_STEPS = 10  # eval 连续不稳定达到该步数后重置
+
+    SCORE_SPEED_REL_TOL = 0.15      # train/eval 水平速度大小相对误差上限
+    SCORE_SPEED_ANGLE_MAX_DEG = 15.0  # train/eval 水平速度方向误差上限(角度值)
+    SCORE_VERT_SPEED_MAX = 0.05     # train/eval 最大垂直速度 (m/s)
+    
+    SCORE_SPEED_EPS = 1e-6          # 速度判定零速阈值，避免除零
 
     SUCCESS_SCORE_THRESHOLD = 60.0  # 成功分数阈值 (0-100)
     FAILURE_TERMINAL_PENALTY = -500.0  # 越界/坠地/坠毁失败终止惩罚
@@ -178,6 +185,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         env._stage2_train_hit_steps = 0
         env._stage2_eval_hold_steps = 0
         env._stage2_eval_max_hold_steps = 0
+        env._stage2_eval_miss_steps = 0
+        env._stage2_eval_hold_active = False
         env._stage2_train_possible_steps = self._possible_steps(
             env, drone_state, platform_state,
             horiz_tol=self.TRAIN_SCORE_RADIUS,
@@ -188,7 +197,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             horiz_tol=self.EVAL_SCORE_RADIUS,
             vert_tol=self.EVAL_SCORE_VERT_TOL,
         )
-        # hold/refund 已移除——由宽 sigma peak 层提供近距连续梯度
+        # 近距连续梯度由 peak 层提供。
 
     # ── 保持判定 / 成功辅助 ───────────────────────────────────────────────────
 
@@ -196,6 +205,41 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     def _smoothstep(x: float) -> float:
         x = float(np.clip(x, 0.0, 1.0))
         return x * x * (3.0 - 2.0 * x)
+
+    def _horizontal_velocity_match(
+        self,
+        *,
+        drone_state: Dict[str, np.ndarray],
+        platform_state: Dict[str, np.ndarray],
+    ) -> bool:
+        drone_vel_xy = np.asarray(drone_state["velocity"][:2], dtype=np.float64)
+        platform_vel_xy = np.asarray(platform_state["velocity"][:2], dtype=np.float64)
+        drone_speed = float(np.linalg.norm(drone_vel_xy))
+        platform_speed = float(np.linalg.norm(platform_vel_xy))
+        eps = float(self.SCORE_SPEED_EPS)
+
+        if platform_speed <= eps:
+            return bool(drone_speed <= eps)
+        if drone_speed <= eps:
+            return False
+
+        speed_rel_err = abs(drone_speed - platform_speed) / platform_speed
+        if speed_rel_err > self.SCORE_SPEED_REL_TOL:
+            return False
+
+        cos_angle = float(np.dot(drone_vel_xy, platform_vel_xy)) / (
+            drone_speed * platform_speed
+        )
+        cos_angle = float(np.clip(cos_angle, -1.0, 1.0))
+        angle_deg = float(np.degrees(np.arccos(cos_angle)))
+        return bool(angle_deg <= self.SCORE_SPEED_ANGLE_MAX_DEG)
+
+    def _vertical_velocity_stable(
+        self,
+        *,
+        drone_state: Dict[str, np.ndarray],
+    ) -> bool:
+        return abs(float(drone_state["velocity"][2])) < self.SCORE_VERT_SPEED_MAX
 
     def is_hold_stable(
         self,
@@ -207,30 +251,37 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         target_vec = target_pos - drone_state["position"]
         horiz_err = float(np.linalg.norm(target_vec[:2]))
         vert_err = abs(float(target_vec[2]))
-        rel_vel = drone_state["velocity"] - platform_state["velocity"]
-        rel_speed = float(np.linalg.norm(rel_vel))
         return (
             horiz_err < self.EVAL_SCORE_RADIUS
             and vert_err < self.EVAL_SCORE_VERT_TOL
-            and rel_speed < self.EVAL_SCORE_REL_SPEED_MAX
+            and self._horizontal_velocity_match(
+                drone_state=drone_state,
+                platform_state=platform_state,
+            )
+            and self._vertical_velocity_stable(drone_state=drone_state)
         )
 
-    @staticmethod
     def _state_in_box(
+        self,
         *,
         drone_state: Dict[str, np.ndarray],
         platform_state: Dict[str, np.ndarray],
         target_pos: np.ndarray,
         horiz_tol: float,
         vert_tol: float,
-        rel_speed_max: float,
     ) -> bool:
         target_vec = target_pos - drone_state["position"]
         horiz_err = float(np.linalg.norm(target_vec[:2]))
         vert_err = abs(float(target_vec[2]))
-        rel_vel = drone_state["velocity"] - platform_state["velocity"]
-        rel_speed = float(np.linalg.norm(rel_vel))
-        return horiz_err < horiz_tol and vert_err < vert_tol and rel_speed < rel_speed_max
+        return (
+            horiz_err < horiz_tol
+            and vert_err < vert_tol
+            and self._horizontal_velocity_match(
+                drone_state=drone_state,
+                platform_state=platform_state,
+            )
+            and self._vertical_velocity_stable(drone_state=drone_state)
+        )
 
     def _possible_steps(
         self,
@@ -291,21 +342,36 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             target_pos=target_pos,
             horiz_tol=self.TRAIN_SCORE_RADIUS,
             vert_tol=self.TRAIN_SCORE_VERT_TOL,
-            rel_speed_max=self.TRAIN_SCORE_REL_SPEED_MAX,
         ):
             env._stage2_train_hit_steps = int(
                 getattr(env, "_stage2_train_hit_steps", 0)
             ) + 1
 
-        if self.is_hold_stable(
+        eval_stable = self.is_hold_stable(
             drone_state=drone_state,
             platform_state=platform_state,
             target_pos=target_pos,
-        ):
-            env._stage2_eval_hold_steps = int(
-                getattr(env, "_stage2_eval_hold_steps", 0)
-            ) + 1
+        )
+        eval_active = bool(getattr(env, "_stage2_eval_hold_active", False))
+        eval_hold_steps = int(getattr(env, "_stage2_eval_hold_steps", 0))
+        eval_miss_steps = int(getattr(env, "_stage2_eval_miss_steps", 0))
+
+        if eval_stable:
+            env._stage2_eval_hold_active = True
+            env._stage2_eval_miss_steps = 0
+            env._stage2_eval_hold_steps = eval_hold_steps + 1
+        elif eval_active:
+            eval_miss_steps += 1
+            if eval_miss_steps < self.EVAL_SCORE_MISS_RESET_STEPS:
+                env._stage2_eval_miss_steps = eval_miss_steps
+                env._stage2_eval_hold_steps = eval_hold_steps + 1
+            else:
+                env._stage2_eval_hold_active = False
+                env._stage2_eval_miss_steps = 0
+                env._stage2_eval_hold_steps = 0
         else:
+            env._stage2_eval_hold_active = False
+            env._stage2_eval_miss_steps = 0
             env._stage2_eval_hold_steps = 0
         env._stage2_eval_max_hold_steps = max(
             int(getattr(env, "_stage2_eval_max_hold_steps", 0)),
@@ -324,9 +390,10 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     # ── 奖励函数 ───────────────────────────────────────────────────
     #
     # 设计思路：
-    #   1. 三层位置函数：反二次（长尾）+ 高斯（中距精度）+ 宽高斯（近距连续梯度）
-    #   2. 速度匹配惩罚：0.15m-0.50m smoothstep 门控，惩罚 |v_drone - v_platform|²
-    #   3. yaw / yaw_rate / action 平滑惩罚保留
+    #   1. 三层位置函数：反二次（长尾）+ 高斯（中距精度）+ 窄高斯（厘米级梯度）
+    #   2. 远距相对闭合速度奖励：鼓励相对平台朝目标移动
+    #   3. 速度匹配惩罚：三轴误差修正速度模型，避免近距速度匹配压制位置收敛
+    #   4. yaw / yaw_rate / action 平滑惩罚保留
 
     def compute_reward(
         self,
@@ -353,7 +420,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         rel_speed = float(np.linalg.norm(rel_vel))
         plat_speed = float(np.linalg.norm(plat_vel))
 
-        # ── 位置奖励：三层叠加 ──
+        # ── 位置奖励 r_pos ：三层叠加 ──
         # 反二次分量：长尾，提供远距离梯度
         POS_APPROACH_WEIGHT = 3.0
         POS_APPROACH_SIGMA_XY = 8.0     # 远距离水平 σ (m)
@@ -373,10 +440,10 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             - (vert_err ** 2) / (2.0 * POS_PRECISE_SIGMA_Z ** 2)
         ))
 
-        # 高斯分量：窄近距峰值——提供 <0.15m 精确梯度
+        # 高斯分量：近距峰值，兼顾厘米级精修与 0.20~0.30m 区间梯度
         POS_PEAK_WEIGHT = 2.0           # 峰值权重
-        POS_PEAK_SIGMA_XY = 0.15        # 峰值水平 σ (m)
-        POS_PEAK_SIGMA_Z = 0.10         # 峰值垂直 σ (m)
+        POS_PEAK_SIGMA_XY = 0.12        # 峰值水平 σ (m)
+        POS_PEAK_SIGMA_Z = 0.08         # 峰值垂直 σ (m)
         r_peak = POS_PEAK_WEIGHT * float(np.exp(
             -(horiz_err ** 2) / (2.0 * POS_PEAK_SIGMA_XY ** 2)
             - (vert_err ** 2) / (2.0 * POS_PEAK_SIGMA_Z ** 2)
@@ -385,28 +452,115 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         # 计算位置奖励总和
         r_pos = r_approach + r_precise + r_peak
 
-        # ── 速度匹配惩罚：近距生效 ──
-        # gate: 0.15m 全开 → 0.50m 全关（反推值）
-        VEL_MATCH_GATE_INNER = 0.15      # 全开水平误差阈值 (m)
-        VEL_MATCH_GATE_OUTER = 0.50      # 全关水平误差阈值 (m)
-        VEL_MATCH_WEIGHT = 1.0           # 速度匹配惩罚权重
+        # ── 远距相对闭合速度奖励 ──
+        CLOSING_WEIGHT = 0.50
+        CLOSING_V_REF = 2.0              # m/s, tanh 限幅参考速度
+        CLOSING_DIST_INNER = 0.75        # 近距关闭，避免干扰速度匹配
+        CLOSING_DIST_OUTER = 3.00        # 远距全开
+        target_dir = target_vec / (dist + 1e-6)
+        closing_speed = float(np.dot(rel_vel, target_dir))
+        gate_far = self._smoothstep(
+            (dist - CLOSING_DIST_INNER)
+            / (CLOSING_DIST_OUTER - CLOSING_DIST_INNER)
+        )
+        r_closing = CLOSING_WEIGHT * gate_far * float(np.tanh(
+            closing_speed / CLOSING_V_REF
+        ))
 
-        gate_vm = self._smoothstep(
+        # ── 速度匹配惩罚 r_vel_match ：误差修正型速度匹配 ──
+        # 该项要求 v_drone ~= v_platform - Kp * (p_drone - p_target)
+        # 这样位置误差存在时允许相对平台产生修正速度，避免速度匹配惩罚
+        # 压制位置误差收敛；当 rel_pos -> 0 时，自然退化为平台速度匹配。
+
+        VEL_MATCH_GATE_INNER = 0.10       # XY 速度惩罚全开水平误差阈值 (m)
+        VEL_MATCH_GATE_OUTER = 0.50       # XY 速度惩罚全关水平误差阈值 (m)
+        VEL_MATCH_Z_GATE_INNER = 0.10     # Z 速度惩罚全开垂直误差阈值 (m)
+        VEL_MATCH_Z_GATE_OUTER = 0.30     # Z 速度惩罚全关垂直误差阈值 (m)
+        VEL_MATCH_EPS = 1e-6              # 避免归一化除零
+        VEL_MATCH_XY_WEIGHT = 0.20        # XY 误差修正速度惩罚权重
+        VEL_MATCH_Z_WEIGHT = 0.30         # Z 误差修正速度惩罚权重
+        VEL_CORR_GAIN_X = 0.7             # X 轴位置误差到期望相对速度的比例增益
+        VEL_CORR_GAIN_Y = 0.7             # Y 轴位置误差到期望相对速度的比例增益
+        VEL_CORR_GAIN_Z = 0.6             # Z 轴位置误差到期望相对速度的比例增益
+        VEL_CORR_MAX_X = 0.25             # X 轴最大期望修正速度 (m/s)
+        VEL_CORR_MAX_Y = 0.25             # Y 轴最大期望修正速度 (m/s)
+        VEL_CORR_MAX_Z = 0.10             # Z 轴最大期望修正速度 (m/s)
+        VEL_ERR_SCALE_X = max(VEL_CORR_MAX_X, VEL_MATCH_EPS)  # X 轴速度误差归一化尺度
+        VEL_ERR_SCALE_Y = max(VEL_CORR_MAX_Y, VEL_MATCH_EPS)  # Y 轴速度误差归一化尺度
+        VEL_ERR_SCALE_Z = max(VEL_CORR_MAX_Z, VEL_MATCH_EPS)  # Z 轴速度误差归一化尺度
+
+        gate_xy = self._smoothstep(
             (VEL_MATCH_GATE_OUTER - horiz_err)
             / (VEL_MATCH_GATE_OUTER - VEL_MATCH_GATE_INNER)
         )
+        gate_z = self._smoothstep(
+            (VEL_MATCH_Z_GATE_OUTER - vert_err)
+            / (VEL_MATCH_Z_GATE_OUTER - VEL_MATCH_Z_GATE_INNER)
+        )
 
-        r_vel_match = -VEL_MATCH_WEIGHT * gate_vm * (rel_speed ** 2)
+        # gate_near_3d 表示“水平和垂直都接近目标”的稳定区门控。
+        # 数值可复用给 Z 速度、yaw、yaw_rate，但变量名按奖励项拆开，
+        # 避免把垂直速度惩罚误读成由 yaw 条件控制。
+        gate_near_3d = float(gate_xy * gate_z)
+        gate_vel_z = gate_near_3d                   # 垂直速度惩罚要求 3D 近距
+        gate_yaw = gate_near_3d                     # 偏航角只在 3D 近距时约束
+        gate_yaw_rate = gate_near_3d                # 偏航角速度同偏航角门控
 
-        # ── 偏航角惩罚（gate_vm 门控：靠近时才关心偏航）──
+        rel_pos = drone_pos - target_pos
+        rel_pos_xy = rel_pos[:2]
+        rel_dist_xy = float(np.linalg.norm(rel_pos_xy))
+        rel_vel_xy = rel_vel[:2]
+        rel_speed_xy = float(np.linalg.norm(rel_vel_xy))
+        rel_speed_z = abs(float(rel_vel[2]))
+
+        def _smooth_l1(norm_error: float) -> float:
+            norm_error = float(abs(norm_error))
+            if norm_error < 1.0:
+                return 0.5 * norm_error ** 2
+            return norm_error - 0.5
+
+        vel_rel_des_x = float(np.clip(
+            -VEL_CORR_GAIN_X * float(rel_pos[0]),
+            -VEL_CORR_MAX_X,
+            VEL_CORR_MAX_X,
+        ))
+        vel_rel_des_y = float(np.clip(
+            -VEL_CORR_GAIN_Y * float(rel_pos[1]),
+            -VEL_CORR_MAX_Y,
+            VEL_CORR_MAX_Y,
+        ))
+        vel_rel_des_z = float(np.clip(
+            -VEL_CORR_GAIN_Z * float(rel_pos[2]),
+            -VEL_CORR_MAX_Z,
+            VEL_CORR_MAX_Z,
+        ))
+
+        vel_err_x = float(rel_vel[0]) - vel_rel_des_x
+        vel_err_y = float(rel_vel[1]) - vel_rel_des_y
+        vel_err_z = float(rel_vel[2]) - vel_rel_des_z
+
+        vel_err_norm_x = abs(vel_err_x) / VEL_ERR_SCALE_X
+        vel_err_norm_y = abs(vel_err_y) / VEL_ERR_SCALE_Y
+        vel_err_norm_z = abs(vel_err_z) / VEL_ERR_SCALE_Z
+
+        loss_xy = _smooth_l1(vel_err_norm_x) + _smooth_l1(vel_err_norm_y)
+        loss_z = _smooth_l1(vel_err_norm_z)
+
+        r_vel_xy = -VEL_MATCH_XY_WEIGHT * gate_xy * loss_xy
+        r_vel_z = -VEL_MATCH_Z_WEIGHT * gate_vel_z * loss_z
+
+        # 计算最终速度惩罚
+        r_vel_match = r_vel_xy + r_vel_z
+
+        # ── 偏航角惩罚（水平/垂直都靠近时才关心偏航）──
         YAW_WEIGHT = 0.20
         yaw = float(drone_state["euler"][2])
-        r_yaw = -YAW_WEIGHT * gate_vm * abs(yaw)
+        r_yaw = -YAW_WEIGHT * gate_yaw * abs(yaw)
 
-        # ── 偏航角速度惩罚（gate_vm 门控：靠近时才关心角速度）──
+        # ── 偏航角速度惩罚（水平/垂直都靠近时才关心角速度）──
         YAW_RATE_WEIGHT = 0.05
         yaw_rate = float(drone_state["yaw_rate"])
-        r_yaw_rate = -YAW_RATE_WEIGHT * gate_vm * (yaw_rate ** 2)
+        r_yaw_rate = -YAW_RATE_WEIGHT * gate_yaw_rate * (yaw_rate ** 2)
 
         # ── 动作平滑和幅值惩罚 ──
         ACTION_SMOOTH_WEIGHT = 0.10   # 动作变化惩罚权重
@@ -419,14 +573,21 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
 
         # 计算总奖励
         total = (
-            r_pos + r_vel_match + r_yaw + r_yaw_rate
+            r_pos + r_closing + r_vel_match + r_yaw + r_yaw_rate
             + r_action
         )
 
+        # 速度修正诊断：
+        #   vel_rel_des_* 表示由位置误差给出的期望相对速度。
+        #   vel_err_* 表示实际相对速度相对该期望值的残差。
+        #   vel_err_norm_* 表示按各轴速度误差尺度归一化后的残差。
         info = {
             "reward/pos": r_pos,
             "reward/peak": r_peak,
+            "reward/closing": r_closing,
             "reward/vel_match": r_vel_match,
+            "reward/vel_match_xy": r_vel_xy,
+            "reward/vel_match_z": r_vel_z,
             "reward/yaw": r_yaw,
             "reward/yaw_rate": r_yaw_rate,
             "reward/action": r_action,
@@ -437,7 +598,26 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "metric/speed": speed,
             "metric/rel_speed": rel_speed,
             "metric/plat_speed": plat_speed,
-            "metric/gate_vm": gate_vm,
+            "metric/closing_speed": closing_speed,
+            "metric/rel_dist_xy": rel_dist_xy,
+            "metric/rel_speed_xy": rel_speed_xy,
+            "metric/rel_speed_z": rel_speed_z,
+            "metric/vel_rel_des_x": vel_rel_des_x,
+            "metric/vel_rel_des_y": vel_rel_des_y,
+            "metric/vel_rel_des_z": vel_rel_des_z,
+            "metric/vel_err_x": vel_err_x,
+            "metric/vel_err_y": vel_err_y,
+            "metric/vel_err_z": vel_err_z,
+            "metric/vel_err_norm_x": vel_err_norm_x,
+            "metric/vel_err_norm_y": vel_err_norm_y,
+            "metric/vel_err_norm_z": vel_err_norm_z,
+            "metric/gate_far": gate_far,
+            "metric/gate_xy": gate_xy,
+            "metric/gate_z": gate_z,
+            "metric/gate_near_3d": gate_near_3d,
+            "metric/gate_vel_z": gate_vel_z,
+            "metric/gate_yaw": gate_yaw,
+            "metric/gate_yaw_rate": gate_yaw_rate,
         }
 
         return float(total), info
@@ -467,7 +647,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "reward_yaw", "reward_yaw_rate", "reward_action",
             "metric_dist", "metric_horiz_err", "metric_vert_err",
             "metric_speed", "metric_rel_speed", "metric_plat_speed",
-            "metric_gate_vm",
+            "metric_gate_xy",
             "metric_motion_type",
         )
 
@@ -487,6 +667,6 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "metric_speed": round(info.get("metric/speed", 0.0), 4),
             "metric_rel_speed": round(info.get("metric/rel_speed", 0.0), 4),
             "metric_plat_speed": round(info.get("metric/plat_speed", 0.0), 4),
-            "metric_gate_vm": round(info.get("metric/gate_vm", 0.0), 4),
+            "metric_gate_xy": round(info.get("metric/gate_xy", 0.0), 4),
             "metric_motion_type": str(info.get("metric/motion_type", "")),
         }

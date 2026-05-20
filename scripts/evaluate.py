@@ -20,8 +20,9 @@
     python scripts/evaluate.py --model output/models/stage1_hover/model_final --stage 1 \
         --hover_height 5 --eval_v_xy_max 10 --eval_v_z_up_max 3 --eval_v_z_down_max 2
 
-    # 将轨迹数据保存到 CSV
-    python scripts/evaluate.py --model output/models/drone_landing/model_final --save_traj
+    # 采集轨迹并生成离线图
+    python scripts/evaluate.py --model output/models/drone_landing/model_final \
+        --traj_enable --traj_plot
 """
 
 import argparse
@@ -51,6 +52,12 @@ EVAL_HOVER_HEIGHT_DEFAULT = 5.0
 EVAL_V_XY_MAX_DEFAULT = 10.0
 EVAL_V_Z_UP_MAX_DEFAULT = 3.0
 EVAL_V_Z_DOWN_MAX_DEFAULT = 2.0
+AVG_MINDIST_ENTRY_HORIZ = 0.50
+AVG_MINDIST_ENTRY_VERT = 0.50
+AVG_MINDIST_ZERO_DEFAULT = 0.20
+DIST_SCORE_FULL = 0.005
+MINDIST_SCORE_ZERO = 0.050
+AVG_MINDIST_SCORE_ZEROS = (0.20, 0.15, 0.10, 0.08)
 
 TRAJ_ENABLE_DEFAULT = False
 TRAJ_PLOT_DEFAULT = False
@@ -117,6 +124,10 @@ TRAJ_EP_SUMMARY_COLS = [
     "train_score",
     "eval_score",
     "min_dist",
+    "avg_min_dist",
+    "avg_min_dist_valid",
+    "min_dist_score",
+    "avg_min_dist_score_z020",
     "sim_time_sec",
     "wall_time_sec",
     "sim_to_real_rate",
@@ -180,8 +191,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--render",     action="store_true", help="Launch PyBullet GUI")
     p.add_argument("--all_stages", action="store_true",
                    help="Evaluate on all four stages sequentially")
-    p.add_argument("--save_traj",  action="store_true",
-                   help="Save per-step trajectory to eval_trajectory.csv")
     p.add_argument(
         "--traj_enable",
         action="store_true",
@@ -379,6 +388,33 @@ def sanitize_positive_int(value: int, default: int, name: str) -> int:
     return v
 
 
+def distance_score(distance: float, *, full: float, zero: float) -> float:
+    """Map a distance to a 0-100 score with a linear falloff."""
+    if not np.isfinite(distance):
+        return 0.0
+    d = float(distance)
+    if d <= full:
+        return 100.0
+    if d >= zero:
+        return 0.0
+    return float(100.0 * (zero - d) / (zero - full))
+
+
+def _stat(values: List[float], fn: str) -> float:
+    if not values:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    if fn == "mean":
+        return float(np.mean(arr))
+    if fn == "median":
+        return float(np.median(arr))
+    if fn == "p90":
+        return float(np.percentile(arr, 90))
+    if fn == "max":
+        return float(np.max(arr))
+    raise ValueError(f"Unsupported stat: {fn}")
+
+
 def resolve_eval_seed(seed: int, random_seed: bool) -> int:
     """返回本次评估使用的 base seed。"""
     if random_seed:
@@ -561,7 +597,6 @@ def evaluate_stage(
     stage: int,
     n_episodes: int,
     render: bool = False,
-    save_traj: bool = False,
     hover_height: Optional[float] = None,
     render_speed: float = 1.0,
     seed: int = 0,
@@ -596,8 +631,12 @@ def evaluate_stage(
         os.makedirs(traj_stage_dir, exist_ok=True)
     platform_half_extents = np.array(env_config.platform.half_extents, dtype=np.float32)
 
-    traj_rows = []
     successes, rewards, lengths, dists = [], [], [], []
+    avg_min_dists, avg_min_dist_valids = [], []
+    min_dist_scores = []
+    avg_min_dist_scores_by_zero = {
+        zero: [] for zero in AVG_MINDIST_SCORE_ZEROS
+    }
     sim_times, wall_times, sim_to_real_rates = [], [], []
     traj_episode_rows: List[Dict] = []
     traj_episode_csv_paths: List[str] = []
@@ -650,6 +689,9 @@ def evaluate_stage(
             ep_r = 0.0
             ep_len = 0
             min_d = np.inf
+            avg_min_dist_active = False
+            avg_min_dist_sum = 0.0
+            avg_min_dist_count = 0
 
             episode_rows: List[Dict] = []
             episode_csv_path = None
@@ -681,10 +723,23 @@ def evaluate_stage(
                 ep_r += reward
                 ep_len += 1
                 done = terminated or truncated
-                min_d = min(min_d, info.get("metric/dist", np.inf))
+                step_dist = float(info.get("metric/dist", np.inf))
+                horiz_err = float(info.get("metric/horiz_err", np.inf))
+                vert_err = float(info.get("metric/vert_err", np.inf))
+                min_d = min(min_d, step_dist)
+
+                if (
+                    not avg_min_dist_active
+                    and horiz_err <= AVG_MINDIST_ENTRY_HORIZ
+                    and vert_err <= AVG_MINDIST_ENTRY_VERT
+                ):
+                    avg_min_dist_active = True
+                if avg_min_dist_active and np.isfinite(step_dist):
+                    avg_min_dist_sum += step_dist
+                    avg_min_dist_count += 1
 
                 # 如果下游功能需要状态，则每步只获取一次。
-                need_state = save_traj or traj_enable or realtime_enabled
+                need_state = traj_enable or realtime_enabled
                 ds = ps = target_pos = None
                 if need_state:
                     ds = env._get_drone_state()
@@ -842,24 +897,25 @@ def evaluate_stage(
                     if remain > 0:
                         time.sleep(remain)
 
-                if save_traj and ds is not None and ps is not None:
-                    traj_rows.append({
-                        "episode": ep,
-                        "step": ep_len,
-                        "stage": stage,
-                        "drone_x": round(float(ds["position"][0]), 4),
-                        "drone_y": round(float(ds["position"][1]), 4),
-                        "drone_z": round(float(ds["position"][2]), 4),
-                        "plat_x": round(float(ps["position"][0]), 4),
-                        "plat_y": round(float(ps["position"][1]), 4),
-                        "dist": round(float(info.get("metric/dist", 0)), 4),
-                        "success": int(info.get("episode", {}).get("success", False)) if done else 0,
-                    })
-
             success = info.get("episode", {}).get("success", False)
             episode_info = info.get("episode", {})
             train_score_val = float(episode_info.get("train_score", 0.0))
             eval_score_val = float(episode_info.get("eval_score", 0.0))
+            avg_min_dist_valid = avg_min_dist_count > 0
+            avg_min_dist = (
+                avg_min_dist_sum / float(avg_min_dist_count)
+                if avg_min_dist_valid else AVG_MINDIST_ZERO_DEFAULT
+            )
+            min_dist_score = distance_score(
+                min_d, full=DIST_SCORE_FULL, zero=MINDIST_SCORE_ZERO
+            )
+            avg_min_dist_scores = {
+                zero: (
+                    distance_score(avg_min_dist, full=DIST_SCORE_FULL, zero=zero)
+                    if avg_min_dist_valid else 0.0
+                )
+                for zero in AVG_MINDIST_SCORE_ZEROS
+            }
 
             ep_wall = max(time.perf_counter() - ep_wall_t0, 1e-9)
             ep_sim = ep_len * env_config.episode.dt
@@ -869,6 +925,11 @@ def evaluate_stage(
             rewards.append(ep_r)
             lengths.append(ep_len)
             dists.append(min_d)
+            avg_min_dists.append(avg_min_dist)
+            avg_min_dist_valids.append(float(avg_min_dist_valid))
+            min_dist_scores.append(min_dist_score)
+            for zero, score in avg_min_dist_scores.items():
+                avg_min_dist_scores_by_zero[zero].append(score)
             sim_times.append(ep_sim)
             wall_times.append(ep_wall)
             sim_to_real_rates.append(ep_rate)
@@ -885,6 +946,12 @@ def evaluate_stage(
                     "train_score": round(train_score_val, 3),
                     "eval_score": round(eval_score_val, 3),
                     "min_dist": round(float(min_d), 6),
+                    "avg_min_dist": round(float(avg_min_dist), 6),
+                    "avg_min_dist_valid": int(avg_min_dist_valid),
+                    "min_dist_score": round(float(min_dist_score), 3),
+                    "avg_min_dist_score_z020": round(
+                        float(avg_min_dist_scores.get(0.20, 0.0)), 3
+                    ),
                     "sim_time_sec": round(float(ep_sim), 6),
                     "wall_time_sec": round(float(ep_wall), 6),
                     "sim_to_real_rate": round(float(ep_rate), 6),
@@ -897,7 +964,9 @@ def evaluate_stage(
                 eval_suffix = f" | Train={train_score_val:.1f} Eval={eval_score_val:.1f}"
             print(
                 f"  Ep {ep+1:3d}/{n_episodes} | {status} | "
-                f"R={ep_r:+8.2f} | L={ep_len:4d} | minDist={min_d:.2f}m"
+                f"R={ep_r:+8.2f} | L={ep_len:4d} | minDist={min_d:.3f}m"
+                f" | avgMinDist={avg_min_dist:.3f}m"
+                f" | avgValid={int(avg_min_dist_valid)}"
                 f" | rate={ep_rate:.2f}x"
                 f"{eval_suffix}"
             )
@@ -918,17 +987,31 @@ def evaluate_stage(
         "std_reward":   float(np.std(rewards)),
         "mean_length":  float(np.mean(lengths)),
         "mean_min_dist": float(np.mean(dists)),
+        "median_min_dist": _stat(dists, "median"),
+        "p90_min_dist": _stat(dists, "p90"),
+        "max_min_dist": _stat(dists, "max"),
+        "mean_avg_min_dist": float(np.mean(avg_min_dists)),
+        "median_avg_min_dist": _stat(avg_min_dists, "median"),
+        "p90_avg_min_dist": _stat(avg_min_dists, "p90"),
+        "max_avg_min_dist": _stat(avg_min_dists, "max"),
+        "avg_min_dist_valid_rate": float(np.mean(avg_min_dist_valids)),
+        "mean_min_dist_score": float(np.mean(min_dist_scores)),
         "mean_sim_time_sec": float(np.mean(sim_times)),
         "mean_wall_time_sec": float(np.mean(wall_times)),
         "mean_sim_to_real_rate": float(np.mean(sim_to_real_rates)),
     }
+    for zero, scores in avg_min_dist_scores_by_zero.items():
+        suffix = f"z{int(round(zero * 1000)):03d}"
+        summary[f"mean_avg_min_dist_score_{suffix}"] = float(np.mean(scores))
 
     if traj_enable and traj_stage_dir:
         summary_csv_path = os.path.join(traj_stage_dir, "episode_summary.csv")
         summary_cols = [
             "episode", "stage", "success", "reward", "length",
             "train_score", "eval_score",
-            "min_dist", "sim_time_sec", "wall_time_sec",
+            "min_dist", "avg_min_dist", "avg_min_dist_valid",
+            "min_dist_score", "avg_min_dist_score_z020",
+            "sim_time_sec", "wall_time_sec",
             "sim_to_real_rate", "traj_csv",
         ]
         _write_csv_rows(summary_csv_path, summary_cols, traj_episode_rows)
@@ -950,9 +1033,6 @@ def evaluate_stage(
         summary["traj_episode_csv_count"] = len(traj_episode_csv_paths)
         summary["traj_summary_csv"] = summary_csv_path
 
-    if save_traj:
-        summary["trajectory"] = traj_rows
-
     return summary
 
 
@@ -968,6 +1048,29 @@ def print_summary(results: list) -> None:
               f"{r['mean_sim_to_real_rate']:>7.2f}x")
         print(f"           mean sim={r['mean_sim_time_sec']:.1f}s, "
               f"mean wall={r['mean_wall_time_sec']:.1f}s")
+        print(
+            "           minDist: "
+            f"mean={r['mean_min_dist']:.4f}m, "
+            f"median={r['median_min_dist']:.4f}m, "
+            f"p90={r['p90_min_dist']:.4f}m, "
+            f"max={r['max_min_dist']:.4f}m, "
+            f"score={r['mean_min_dist_score']:.1f}"
+        )
+        print(
+            "           avgMinDist: "
+            f"mean={r['mean_avg_min_dist']:.4f}m, "
+            f"median={r['median_avg_min_dist']:.4f}m, "
+            f"p90={r['p90_avg_min_dist']:.4f}m, "
+            f"max={r['max_avg_min_dist']:.4f}m, "
+            f"valid={r['avg_min_dist_valid_rate']:.1%}"
+        )
+        print(
+            "           avgMinDist scores: "
+            f"z0.20={r['mean_avg_min_dist_score_z200']:.1f}, "
+            f"z0.15={r['mean_avg_min_dist_score_z150']:.1f}, "
+            f"z0.10={r['mean_avg_min_dist_score_z100']:.1f}, "
+            f"z0.08={r['mean_avg_min_dist_score_z080']:.1f}"
+        )
     print(f"{'='*60}\n")
 
 
@@ -1014,7 +1117,6 @@ def main() -> None:
         print(f"[INFO] 轨迹输出目录: {traj_run_dir}")
 
     all_results = []
-    all_traj    = []
 
     # GUI 渲染期间在 Windows 上启用高精度计时。
     try:
@@ -1029,7 +1131,6 @@ def main() -> None:
                     model, env_config, stage,
                     n_episodes=args.episodes,
                     render=(args.render and stage == stages[-1]),
-                    save_traj=args.save_traj,
                     hover_height=hover_height,
                     render_speed=render_speed,
                     seed=eval_seed,
@@ -1040,8 +1141,6 @@ def main() -> None:
                     traj_realtime_refresh=traj_realtime_refresh,
                 )
                 all_results.append(result)
-                if args.save_traj and "trajectory" in result:
-                    all_traj.extend(result.pop("trajectory"))
     except KeyboardInterrupt:
         print("\n[INFO] 用户中断评估，已安全退出。")
         return
@@ -1064,15 +1163,6 @@ def main() -> None:
             print(f"[WARN] 离线轨迹绘图失败: {exc}")
 
     print_summary(all_results)
-
-    # 保存轨迹 CSV
-    if args.save_traj and all_traj:
-        traj_path = "eval_trajectory.csv"
-        with open(traj_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=all_traj[0].keys())
-            writer.writeheader()
-            writer.writerows(all_traj)
-        print(f"Trajectory saved → {traj_path}")
 
 
 if __name__ == "__main__":

@@ -309,7 +309,7 @@ python scripts/export_model.py --model output\models\drone_landing\model_final -
 3. **Stage 3/4 奖励待实现**：已注册但 `compute_reward()` 抛出 `NotImplementedError`。
 4. **reward CSV 体积过大**：逐步 reward CSV 每步、每环境写入，长训练可快速增长到 GB 级。后续可考虑采样频率开关或仅在 debug 时启用。
 5. **仿真和真实系统存在 sim-to-real 缺口**：当前 PyBullet 是运动学体模拟，无真实气动/电机/PX4 内环动力学，适合训练高层速度策略。
-6. **策略指标由课程策略声明**：旧实验 `hover_score` 已移除，成功判定和评估字段由各策略独立定义。
+6. **策略指标由课程策略声明**：成功判定和评估字段由各策略独立定义。
 7. **终端惩罚需谨慎设置**：过大的终端惩罚（>-500）会导致 OOB episode 的 TD 误差产生 critic_loss 尖峰，破坏 Q 函数稳定性。推荐 -500 以下，利用正常 episode 的机会成本而非惩罚幅值来阻止 OOB。
 8. **LR 衰减在 resume 时需手动应用**：`SAC.load()` 不会继承 callable learning_rate，需在加载后手动设置 `model.learning_rate = lr_schedule`，否则 LR 冻结在 checkpoint 保存时的固定值。
 

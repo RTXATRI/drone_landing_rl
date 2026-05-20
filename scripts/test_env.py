@@ -30,13 +30,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from configs.env_config import EnvConfig
+from configs.train_config import TrainConfig
 from curriculum.curriculum_manager import CurriculumManager
 from curriculum.strategies import create_strategy
 from envs.drone_landing_env import DroneLandingEnv
 from envs.landing_platform.moving_platform import MovingPlatform
 from envs.landing_platform.motions import LissajousMotion, PatrolMotion, WaypointMotion
 from scripts.evaluate import apply_eval_control_config
-from training.trainer import EPISODE_INFO_KEYWORDS
+from training.trainer import EPISODE_INFO_KEYWORDS, Trainer
 
 PASS = "  [PASS]"
 FAIL = "  [FAIL]"
@@ -159,8 +160,8 @@ def test_curriculum_stages(env_config: EnvConfig, render_mode) -> bool:
                     ok &= _check(True, f"Stage {stage}: reward is explicitly pending")
 
             # 在 episode 中途切换阶段
-            env.set_curriculum_stage(min(stage + 1, 4))
-            ok &= _check(True, f"Stage {stage}: set_curriculum_stage() OK")
+            env.set_strategy(create_strategy(min(stage + 1, 4), env.config))
+            ok &= _check(True, f"Stage {stage}: set_strategy() OK")
             env.close()
         except Exception as e:
             _check(False, f"Stage {stage}: EXCEPTION — {e}")
@@ -236,7 +237,7 @@ def test_action_smoothing(env: DroneLandingEnv) -> bool:
 def test_stage1_platform_defaults(env: DroneLandingEnv) -> bool:
     _header("Test 7: Stage-1 Platform Defaults")
     ok = True
-    env.set_curriculum_stage(1)
+    env.set_strategy(create_strategy(1, env.config))
     obs, _ = env.reset(seed=8)
     ps = env._get_platform_state()
 
@@ -342,7 +343,7 @@ def test_spawn_range_and_oob_margin(env: DroneLandingEnv) -> bool:
     _header("Test 11: Spawn Range & OOB Margin")
     ok = True
     cfg = env.config.episode
-    env.set_curriculum_stage(1)
+    env.set_strategy(create_strategy(1, env.config))
 
     for seed in range(30, 45):
         env.reset(seed=seed)
@@ -414,8 +415,6 @@ def test_stage1_terminal_behavior() -> bool:
                  "train mode: wide Stage 1 success space marks success")
     ok &= _check(float(train_ep.get("train_score", 0.0)) > 60.0,
                  f"train mode: train_score > 60  [got {train_ep.get('train_score', 0.0):.1f}]")
-    ok &= _check("hover_score" not in train_ep,
-                 "Stage 1 episode info still does not export old hover_score")
     train_env.close()
 
     eval_fail_cfg = EnvConfig()
@@ -507,23 +506,18 @@ def test_vecmonitor_preserves_episode_core_fields() -> bool:
                  "VecMonitor keeps SB3 native r/l/t episode fields")
     ok &= _check(bool(ep.get("success", False)),
                  "VecMonitor preserves custom success field")
-    ok &= _check(ep.get("episode_stage", 0) == 1,
-                 "VecMonitor preserves custom episode_stage field")
+    ok &= _check(ep.get("stage", 0) == 1,
+                 "VecMonitor preserves custom stage field")
     ok &= _check(all(key in ep for key in STAGE1_EPISODE_METRIC_KEYS),
                  "VecMonitor preserves Stage 1 episode metric keys")
     ok &= _check(float(ep.get("train_score", 0.0)) > 60.0,
                  "VecMonitor preserves train_score")
-    ok &= _check("hover_score" not in ep, "VecMonitor episode has no hover_score")
     return ok
 
 
 def test_manual_curriculum_api() -> bool:
     _header("Test 15: Manual Curriculum API")
     ok = True
-    ok &= _check(not hasattr(CurriculumManager, "should_advance"),
-                 "CurriculumManager has no automatic should_advance API")
-    ok &= _check(not hasattr(CurriculumManager, "advance_stage"),
-                 "CurriculumManager has no automatic advance_stage API")
     ok &= _check(hasattr(CurriculumManager, "set_stage"),
                  "CurriculumManager exposes manual set_stage API")
     return ok
@@ -733,6 +727,10 @@ def test_stage1_strategy_reward_shape() -> bool:
         "metric/horiz_err",
         "metric/vert_err",
         "metric/speed",
+        "metric/gate_near_3d",
+        "metric/gate_vel",
+        "metric/gate_yaw_angle",
+        "metric/gate_yaw_rate",
     }
     ok &= _check(np.isfinite(center_reward), "Stage 1 reward is finite")
     ok &= _check(center["reward/pos"] > offset["reward/pos"] > far["reward/pos"],
@@ -761,12 +759,12 @@ def test_stage2_strategy_reward_shape() -> bool:
         "angular_rate": np.zeros(3, dtype=np.float32),
     }
 
-    def _info_at(pos, velocity=(0.0, 0.0, 0.0)):
+    def _info_at(pos, velocity=(0.0, 0.0, 0.0), yaw=0.0, yaw_rate=0.0):
         drone = {
             "position": np.array(pos, dtype=np.float32),
             "velocity": np.array(velocity, dtype=np.float32),
-            "euler": np.zeros(3, dtype=np.float32),
-            "yaw_rate": np.float32(0.0),
+            "euler": np.array([0.0, 0.0, yaw], dtype=np.float32),
+            "yaw_rate": np.float32(yaw_rate),
         }
         reward, info = strategy.compute_reward(
             env=None,
@@ -780,14 +778,69 @@ def test_stage2_strategy_reward_shape() -> bool:
         )
         return float(reward), info
 
+    smoothstep_cases = {
+        -1.0: 0.0,
+        0.0: 0.0,
+        0.5: 0.5,
+        1.0: 1.0,
+        2.0: 1.0,
+    }
+    for x, expected in smoothstep_cases.items():
+        ok &= _check(np.isclose(strategy._smoothstep(x), expected, atol=1e-12),
+                     f"Stage 2 smoothstep clips input {x} to expected gate {expected}")
+
     _, center = _info_at([0.0, 0.0, 5.0])
+    _, one_cm = _info_at([0.01, 0.0, 5.0])
+    _, three_cm = _info_at([0.03, 0.0, 5.0])
+    _, five_cm = _info_at([0.05, 0.0, 5.0])
+    _, ten_cm = _info_at([0.10, 0.0, 5.0])
+    _, twenty_cm = _info_at([0.20, 0.0, 5.0])
     _, near = _info_at([0.3, 0.0, 5.0])
     _, mid = _info_at([5.0, 0.0, 5.0])
     _, far = _info_at([30.0, 0.0, 5.0])
     _, vert_far = _info_at([0.0, 0.0, 0.0])
-    # 速度匹配：靠近目标 + 有相对速度时产生惩罚
+    # 速度匹配：靠近目标 + 偏离误差修正速度时产生惩罚
+    _, vel_center_match = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.0))
+    _, vm_x_010 = _info_at([0.0, 0.0, 5.0], velocity=(1.10, 0.0, 0.0))
+    _, vm_x_020 = _info_at([0.0, 0.0, 5.0], velocity=(1.20, 0.0, 0.0))
+    _, corr_x_probe = _info_at([0.1, 0.0, 5.0], velocity=(1.0, 0.0, 0.0))
+    _, corr_y_probe = _info_at([0.0, 0.1, 5.0], velocity=(1.0, 0.0, 0.0))
+    _, corr_z_probe = _info_at([0.0, 0.0, 5.02], velocity=(1.0, 0.0, 0.0))
+    _, corr_x_ideal = _info_at(
+        [0.1, 0.0, 5.0],
+        velocity=(1.0 + corr_x_probe["metric/vel_rel_des_x"], 0.0, 0.0),
+    )
+    _, corr_x_bad = _info_at([0.1, 0.0, 5.0], velocity=(1.5, 0.0, 0.0))
+    _, corr_y_ideal = _info_at(
+        [0.0, 0.1, 5.0],
+        velocity=(1.0, corr_y_probe["metric/vel_rel_des_y"], 0.0),
+    )
+    _, corr_y_bad = _info_at([0.0, 0.1, 5.0], velocity=(1.0, 0.5, 0.0))
+    _, corr_z_ideal = _info_at(
+        [0.0, 0.0, 5.02],
+        velocity=(1.0, 0.0, corr_z_probe["metric/vel_rel_des_z"]),
+    )
+    _, corr_z_bad = _info_at([0.0, 0.0, 5.02], velocity=(1.0, 0.0, 0.05))
+    _, corr_x_clip = _info_at([3.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.0))
+    _, corr_y_clip = _info_at([0.0, 3.0, 5.0], velocity=(1.0, 0.0, 0.0))
+    _, corr_z_clip = _info_at([0.0, 0.0, 6.0], velocity=(1.0, 0.0, 0.0))
+    _, norm_x_unit = _info_at([0.0, 0.0, 5.0], velocity=(1.3, 0.0, 0.0))
+    _, norm_y_unit = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.3, 0.0))
+    _, norm_z_unit = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.15))
     _, vm_near = _info_at([0.1, 0.0, 5.0], velocity=(0.5, 0.0, 0.0))
     _, vm_far = _info_at([3.0, 0.0, 5.0], velocity=(0.5, 0.0, 0.0))
+    _, vm_z_far = _info_at([0.0, 0.0, 4.0], velocity=(1.0, 0.0, 1.0))
+    _, vm_xy_z_far = _info_at([0.0, 0.0, 4.0], velocity=(2.0, 0.0, 0.0))
+    _, vm_xy_far_z_near = _info_at([3.0, 0.0, 5.0], velocity=(1.0, 0.0, 1.0))
+    _, vm_z_near = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 1.0))
+    _, vm_z_005 = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.05))
+    _, vm_z_010 = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.10))
+    _, vm_z_clip = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.20))
+    _, yaw_z_far = _info_at([0.0, 0.0, 4.0], velocity=(1.0, 0.0, 0.0), yaw=1.0, yaw_rate=1.0)
+    _, yaw_near = _info_at([0.0, 0.0, 5.0], velocity=(1.0, 0.0, 0.0), yaw=1.0, yaw_rate=1.0)
+    _, closing_toward = _info_at([10.0, 0.0, 5.0], velocity=(-1.0, 0.0, 0.0))
+    _, closing_away = _info_at([10.0, 0.0, 5.0], velocity=(3.0, 0.0, 0.0))
+    _, closing_near = _info_at([0.5, 0.0, 5.0], velocity=(-1.0, 0.0, 0.0))
 
     # 位置奖励在目标中心处最大
     ok &= _check(center["reward/pos"] >= 7.0,
@@ -795,6 +848,19 @@ def test_stage2_strategy_reward_shape() -> bool:
     # 位置奖励随距离单调衰减
     ok &= _check(center["reward/pos"] > near["reward/pos"] > mid["reward/pos"],
                  "Stage 2 position reward decays with distance from target")
+    # peak 层应在厘米级和 0.20~0.30m 区间都保持有效梯度。
+    ok &= _check(
+        center["reward/pos"] > one_cm["reward/pos"] > three_cm["reward/pos"]
+        > five_cm["reward/pos"] > ten_cm["reward/pos"]
+        > twenty_cm["reward/pos"] > near["reward/pos"],
+        "Stage 2 position reward remains monotonic from centimeter to 30cm range",
+    )
+    ok &= _check(center["reward/pos"] - one_cm["reward/pos"] >= 0.006,
+                 f"Stage 2 1cm position gap remains meaningful  [got {center['reward/pos'] - one_cm['reward/pos']:.5f}]")
+    ok &= _check(ten_cm["reward/pos"] - twenty_cm["reward/pos"] >= 0.80,
+                 f"Stage 2 10cm-to-20cm position gradient is not flat  [got {ten_cm['reward/pos'] - twenty_cm['reward/pos']:.5f}]")
+    ok &= _check(twenty_cm["reward/pos"] - near["reward/pos"] >= 0.40,
+                 f"Stage 2 20cm-to-30cm position gradient is not flat  [got {twenty_cm['reward/pos'] - near['reward/pos']:.5f}]")
     # 远距离仍有梯度
     ok &= _check(far["reward/pos"] > 0.01,
                  f"Stage 2 far-range position gradient is present  [got {far['reward/pos']:.4f}]")
@@ -802,12 +868,104 @@ def test_stage2_strategy_reward_shape() -> bool:
     ok &= _check(vert_far["reward/pos"] < center["reward/pos"],
                  "Stage 2 vertical error reduces position reward")
 
-    # 速度匹配：远离目标时不开门
-    ok &= _check(vm_far["metric/gate_vm"] < 1e-6,
-                 f"Stage 2 velocity-match gate is off when far  [got {vm_far['metric/gate_vm']:.4f}]")
+    # 速度匹配：误差修正型速度模型 rel_vel -> -Kp * rel_pos。
+    ok &= _check(abs(vel_center_match["reward/vel_match"]) < 1e-6,
+                 f"Stage 2 velocity-match is zero at target when matching platform speed  [got {vel_center_match['reward/vel_match']:.6f}]")
+    ok &= _check(corr_x_ideal["metric/vel_rel_des_x"] < 0.0,
+                 "Stage 2 positive X error asks for negative relative X velocity")
+    ok &= _check(corr_y_ideal["metric/vel_rel_des_y"] < 0.0,
+                 "Stage 2 positive Y error asks for negative relative Y velocity")
+    ok &= _check(corr_z_ideal["metric/vel_rel_des_z"] < 0.0,
+                 "Stage 2 positive Z error asks for negative relative Z velocity")
+    ok &= _check(abs(corr_x_ideal["reward/vel_match_xy"]) < 1e-6,
+                 f"Stage 2 X correction velocity has minimal XY penalty  [got {corr_x_ideal['reward/vel_match_xy']:.6f}]")
+    ok &= _check(abs(corr_y_ideal["reward/vel_match_xy"]) < 1e-6,
+                 f"Stage 2 Y correction velocity has minimal XY penalty  [got {corr_y_ideal['reward/vel_match_xy']:.6f}]")
+    ok &= _check(abs(corr_z_ideal["reward/vel_match_z"]) < 1e-6,
+                 f"Stage 2 Z correction velocity has minimal Z penalty  [got {corr_z_ideal['reward/vel_match_z']:.6f}]")
+    ok &= _check(0.01 <= abs(vm_x_010["reward/vel_match_xy"]) <= 0.03,
+                 f"Stage 2 XY penalty at 0.10m/s residual stays V3-scale  [got {vm_x_010['reward/vel_match_xy']:.5f}]")
+    ok &= _check(0.05 <= abs(vm_x_020["reward/vel_match_xy"]) <= 0.08,
+                 f"Stage 2 XY penalty at 0.20m/s residual stays V3-scale  [got {vm_x_020['reward/vel_match_xy']:.5f}]")
+    ok &= _check(corr_x_bad["reward/vel_match_xy"] < corr_x_ideal["reward/vel_match_xy"] - 0.1,
+                 "Stage 2 XY penalty increases when X relative velocity misses correction target")
+    ok &= _check(corr_y_bad["reward/vel_match_xy"] < corr_y_ideal["reward/vel_match_xy"] - 0.1,
+                 "Stage 2 XY penalty increases when Y relative velocity misses correction target")
+    ok &= _check(corr_z_bad["reward/vel_match_z"] < corr_z_ideal["reward/vel_match_z"] - 0.01,
+                 "Stage 2 Z penalty increases when Z relative velocity misses correction target")
+    x_scale = abs(corr_x_clip["metric/vel_rel_des_x"])
+    y_scale = abs(corr_y_clip["metric/vel_rel_des_y"])
+    z_scale = abs(corr_z_clip["metric/vel_rel_des_z"])
+    ok &= _check(corr_x_clip["metric/vel_rel_des_x"] < 0.0 and x_scale > 0.0,
+                 "Stage 2 X correction velocity is clipped by an independent finite limit")
+    ok &= _check(corr_y_clip["metric/vel_rel_des_y"] < 0.0 and y_scale > 0.0,
+                 "Stage 2 Y correction velocity is clipped by an independent finite limit")
+    ok &= _check(corr_z_clip["metric/vel_rel_des_z"] < 0.0 and z_scale > 0.0,
+                 "Stage 2 Z correction velocity is clipped by an independent finite limit")
+    ok &= _check(np.isclose(norm_x_unit["metric/vel_err_norm_x"], 0.30 / x_scale, atol=1e-6),
+                 "Stage 2 X velocity residual normalizes by configured X scale")
+    ok &= _check(np.isclose(norm_y_unit["metric/vel_err_norm_y"], 0.30 / y_scale, atol=1e-6),
+                 "Stage 2 Y velocity residual normalizes by configured Y scale")
+    ok &= _check(np.isclose(norm_z_unit["metric/vel_err_norm_z"], 0.15 / z_scale, atol=1e-6),
+                 "Stage 2 Z velocity residual normalizes by configured Z scale")
+
+    # 速度匹配：远距关闭速度惩罚门控
+    ok &= _check(vm_far["metric/gate_xy"] < 1e-6,
+                 f"Stage 2 velocity-match gate is off when far  [got {vm_far['metric/gate_xy']:.4f}]")
+    ok &= _check(abs(vm_far["reward/vel_match"]) < 1e-6,
+                 f"Stage 2 velocity-match penalty is gated off when far  [got {vm_far['reward/vel_match']:.4f}]")
     # 速度匹配：靠近时产生有意义的惩罚
     ok &= _check(vm_near["reward/vel_match"] < -0.01,
                  f"Stage 2 velocity-match penalizes rel-speed when close  [got {vm_near['reward/vel_match']:.4f}]")
+    ok &= _check(vm_near["reward/vel_match"] <= 0.0,
+                 "Stage 2 velocity-match remains a penalty term")
+    # 垂直误差大时，不应惩罚垂直修正速度；水平速度匹配仍应生效。
+    ok &= _check(abs(vm_z_far["reward/vel_match"]) < 1e-6,
+                 f"Stage 2 vertical speed-match gate closes when z error is large  [got {vm_z_far['reward/vel_match']:.4f}]")
+    ok &= _check(vm_xy_z_far["reward/vel_match"] < -0.1,
+                 f"Stage 2 XY speed-match remains active when only z error is large  [got {vm_xy_z_far['reward/vel_match']:.4f}]")
+    ok &= _check(np.isclose(vm_z_far["metric/gate_vel_z"], vm_z_far["metric/gate_near_3d"]),
+                 "Stage 2 vertical velocity gate uses the named 3D-near gate")
+    ok &= _check(vm_xy_far_z_near["metric/gate_z"] > 0.99 and vm_xy_far_z_near["metric/gate_vel_z"] < 1e-6,
+                 "Stage 2 vertical velocity gate closes when horizontal error is large")
+    gate_keys = (
+        "metric/gate_xy", "metric/gate_z",
+        "metric/gate_near_3d", "metric/gate_vel_z",
+        "metric/gate_yaw", "metric/gate_yaw_rate",
+    )
+    for name, sample in {
+        "center": center,
+        "far": vm_far,
+        "vertical_far": vm_z_far,
+        "horizontal_far_vertical_near": vm_xy_far_z_near,
+    }.items():
+        ok &= _check(all(0.0 <= sample[key] <= 1.0 for key in gate_keys),
+                     f"Stage 2 velocity/yaw gates stay in [0,1] for {name}")
+    ok &= _check(vm_z_005["reward/vel_match_z"] < 0.0,
+                 f"Stage 2 vertical velocity penalty responds at 0.05m/s  [got {vm_z_005['reward/vel_match_z']:.4f}]")
+    ok &= _check(vm_z_010["reward/vel_match_z"] < vm_z_005["reward/vel_match_z"],
+                 "Stage 2 vertical velocity penalty increases from 0.05m/s to 0.10m/s")
+    ok &= _check(vm_z_clip["reward/vel_match_z"] < vm_z_010["reward/vel_match_z"],
+                 "Stage 2 vertical velocity SmoothL1 penalty keeps increasing for larger residuals")
+    ok &= _check(vm_z_near["reward/vel_match_z"] <= vm_z_clip["reward/vel_match_z"],
+                 "Stage 2 vertical velocity penalty remains active when 3D-near")
+    ok &= _check(np.isfinite(center["metric/vel_err_norm_x"])
+                 and np.isfinite(center["metric/vel_err_norm_y"])
+                 and np.isfinite(center["metric/vel_err_norm_z"])
+                 and np.isfinite(center["reward/vel_match"]),
+                 "Stage 2 correction velocity metrics are finite at zero horizontal distance")
+    ok &= _check(abs(yaw_z_far["reward/yaw"]) < 1e-6 and abs(yaw_z_far["reward/yaw_rate"]) < 1e-6,
+                 "Stage 2 yaw penalties are gated off when vertical error is large")
+    ok &= _check(yaw_near["reward/yaw"] < -0.1 and yaw_near["reward/yaw_rate"] < -0.01,
+                 "Stage 2 yaw penalties are active when both horizontal and vertical errors are small")
+
+    # 远距闭合速度奖励：相对平台朝目标为正，远离为负，近距关闭。
+    ok &= _check(closing_toward["reward/closing"] > 0.0,
+                 f"Stage 2 far-range closing reward is positive when moving toward target  [got {closing_toward['reward/closing']:.4f}]")
+    ok &= _check(closing_away["reward/closing"] < 0.0,
+                 f"Stage 2 far-range closing reward is negative when moving away from target  [got {closing_away['reward/closing']:.4f}]")
+    ok &= _check(abs(closing_near["reward/closing"]) < 1e-6,
+                 f"Stage 2 closing reward is off near target  [got {closing_near['reward/closing']:.4f}]")
 
     # peak 层在 <0.15m 提供非零梯度
     ok &= _check(center["reward/peak"] > near["reward/peak"],
@@ -815,18 +973,23 @@ def test_stage2_strategy_reward_shape() -> bool:
 
     # 必需 info 键存在
     expected_keys = {
-        "reward/pos", "reward/peak", "reward/vel_match", "reward/yaw",
+        "reward/pos", "reward/peak", "reward/closing", "reward/vel_match", "reward/yaw",
         "reward/yaw_rate", "reward/action", "reward/total",
+        "reward/vel_match_xy", "reward/vel_match_z",
         "metric/dist", "metric/horiz_err", "metric/vert_err",
         "metric/speed", "metric/rel_speed", "metric/plat_speed",
-        "metric/gate_vm",
+        "metric/rel_dist_xy", "metric/rel_speed_xy",
+        "metric/rel_speed_z",
+        "metric/vel_rel_des_x", "metric/vel_rel_des_y", "metric/vel_rel_des_z",
+        "metric/vel_err_x", "metric/vel_err_y", "metric/vel_err_z",
+        "metric/vel_err_norm_x", "metric/vel_err_norm_y", "metric/vel_err_norm_z",
+        "metric/closing_speed", "metric/gate_far",
+        "metric/gate_xy", "metric/gate_z",
+        "metric/gate_near_3d", "metric/gate_vel_z",
+        "metric/gate_yaw", "metric/gate_yaw_rate",
     }
     ok &= _check(expected_keys.issubset(center.keys()),
                  "Stage 2 reward info exposes all required simplified keys")
-    # 不应包含 hold/refund 键
-    excluded_keys = {"reward/hold", "reward/hold_break", "metric/r_hold_total"}
-    ok &= _check(excluded_keys.isdisjoint(center.keys()),
-                 "Stage 2 reward info does not contain hold/refund keys")
     return ok
 
 
@@ -893,7 +1056,38 @@ def test_hold_reward_space_independence() -> bool:
     ok &= _check(env1._stage1_train_hit_steps == 1 and env1._stage1_eval_hold_steps == 0,
                  "Stage 1 train_score space can differ from eval/reward hold space")
 
-    # Stage 2: peak 层在 <0.15m 提供非零连续梯度（替代旧 hold/refund）
+    def _stage1_counts(drone):
+        env = _env()
+        s1.reset_episode_metrics(env, drone, platform1)
+        s1.update_step_metrics(env, drone, platform1, target1)
+        return env._stage1_train_hit_steps, env._stage1_eval_hold_steps
+
+    stage1_vz_ok = {
+        "position": target1.copy(),
+        "velocity": np.array([0.0, 0.0, 0.04], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    stage1_vz_bad = {
+        "position": target1.copy(),
+        "velocity": np.array([0.0, 0.0, 0.06], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    stage1_xy_bad = {
+        "position": target1.copy(),
+        "velocity": np.array([0.16, 0.0, 0.04], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "yaw_rate": np.float32(0.0),
+    }
+    ok &= _check(_stage1_counts(stage1_vz_ok) == (1, 1),
+                 "Stage 1 score accepts stable horizontal speed with vz below 0.05m/s")
+    ok &= _check(_stage1_counts(stage1_vz_bad) == (0, 0),
+                 "Stage 1 score rejects vz above 0.05m/s")
+    ok &= _check(_stage1_counts(stage1_xy_bad) == (0, 0),
+                 "Stage 1 score rejects excessive horizontal speed")
+
+    # Stage 2: peak 层在 <0.15m 提供非零连续梯度。
     s2 = create_strategy(2, cfg)
     env2 = _env()
     target2 = np.array([0.0, 0.0, 5.0], dtype=np.float32)
@@ -929,12 +1123,78 @@ def test_hold_reward_space_independence() -> bool:
                  "Stage 2 peak reward provides continuous gradient at close range")
     ok &= _check(s2_center["reward/peak"] > 0.5,
                  f"Stage 2 peak reward at center is significant  [got {s2_center['reward/peak']:.4f}]")
-    # 不应存在 hold/refund 键
-    ok &= _check("reward/hold" not in s2_center and "reward/hold_break" not in s2_center,
-                 "Stage 2 reward info does not contain hold/refund keys")
     s2.update_step_metrics(env2, at_0d1m, platform2, target2)
     ok &= _check(env2._stage2_train_hit_steps == 1 and env2._stage2_eval_hold_steps == 0,
                  "Stage 2 train_score space can differ from eval hold space")
+
+    def _stage2_drone(velocity):
+        return {
+            "position": target2.copy(),
+            "velocity": np.array(velocity, dtype=np.float32),
+            "euler": np.zeros(3, dtype=np.float32),
+            "yaw_rate": np.float32(0.0),
+        }
+
+    def _stage2_counts(drone, platform):
+        env = _env()
+        s2.reset_episode_metrics(env, drone, platform)
+        s2.update_step_metrics(env, drone, platform, target2)
+        return env._stage2_train_hit_steps, env._stage2_eval_hold_steps
+
+    moving_platform2 = {
+        "position": np.zeros(3, dtype=np.float32),
+        "velocity": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "euler": np.zeros(3, dtype=np.float32),
+        "angular_rate": np.zeros(3, dtype=np.float32),
+    }
+    speed_within = 1.0 + 0.5 * float(s2.SCORE_SPEED_REL_TOL)
+    speed_above = 1.0 + float(s2.SCORE_SPEED_REL_TOL) + 0.01
+    stable_vz = 0.8 * float(s2.SCORE_VERT_SPEED_MAX)
+    high_vz = 1.2 * float(s2.SCORE_VERT_SPEED_MAX)
+    angle_within = np.deg2rad(max(0.0, float(s2.SCORE_SPEED_ANGLE_MAX_DEG) - 1.0))
+    angle_above = np.deg2rad(float(s2.SCORE_SPEED_ANGLE_MAX_DEG) + 1.0)
+    ok &= _check(_stage2_counts(_stage2_drone([speed_within, 0.0, stable_vz]), moving_platform2) == (1, 1),
+                 "Stage 2 score accepts horizontal speed error within configured tolerance")
+    ok &= _check(_stage2_counts(_stage2_drone([speed_within, 0.0, high_vz]), moving_platform2) == (0, 0),
+                 "Stage 2 score rejects vz above configured limit")
+    ok &= _check(_stage2_counts(_stage2_drone([speed_above, 0.0, stable_vz]), moving_platform2) == (0, 0),
+                 "Stage 2 score rejects horizontal speed error above configured tolerance")
+    ok &= _check(_stage2_counts(
+        _stage2_drone([np.cos(angle_within), np.sin(angle_within), stable_vz]),
+        moving_platform2,
+    ) == (1, 1), "Stage 2 score accepts horizontal heading error within configured tolerance")
+    ok &= _check(_stage2_counts(
+        _stage2_drone([np.cos(angle_above), np.sin(angle_above), stable_vz]),
+        moving_platform2,
+    ) == (0, 0), "Stage 2 score rejects horizontal heading error above configured tolerance")
+    ok &= _check(_stage2_counts(_stage2_drone([0.0, 0.0, stable_vz]), platform2) == (1, 1),
+                 "Stage 2 score accepts both platform/drone horizontal zero speed")
+    ok &= _check(_stage2_counts(_stage2_drone([0.01, 0.0, stable_vz]), platform2) == (0, 0),
+                 "Stage 2 score rejects drone horizontal motion when platform is zero speed")
+
+    env_tol = _env()
+    s2.reset_episode_metrics(env_tol, at_center, platform2)
+    s2.update_step_metrics(env_tol, at_center, platform2, target2)
+    ok &= _check(env_tol._stage2_eval_hold_steps == 1,
+                 "Stage 2 eval tolerance starts after first stable step")
+    for _ in range(s2.EVAL_SCORE_MISS_RESET_STEPS - 1):
+        s2.update_step_metrics(env_tol, at_0d3m, platform2, target2)
+    ok &= _check(env_tol._stage2_eval_hold_steps == s2.EVAL_SCORE_MISS_RESET_STEPS,
+                 "Stage 2 eval tolerance counts short unstable runs into same hold segment")
+    ok &= _check(env_tol._stage2_eval_miss_steps == s2.EVAL_SCORE_MISS_RESET_STEPS - 1,
+                 "Stage 2 eval tolerance tracks consecutive unstable steps")
+    s2.update_step_metrics(env_tol, at_0d3m, platform2, target2)
+    ok &= _check(env_tol._stage2_eval_hold_steps == 0
+                 and env_tol._stage2_eval_max_hold_steps == s2.EVAL_SCORE_MISS_RESET_STEPS,
+                 "Stage 2 eval tolerance resets on the 10th consecutive unstable step")
+    s2.update_step_metrics(env_tol, at_0d3m, platform2, target2)
+    ok &= _check(env_tol._stage2_eval_hold_steps == 0,
+                 "Stage 2 eval tolerance does not count after reset until stable again")
+    s2.update_step_metrics(env_tol, at_center, platform2, target2)
+    ok &= _check(env_tol._stage2_eval_hold_steps == 1,
+                 "Stage 2 eval tolerance restarts from 1 after becoming stable again")
+    ok &= _check(env_tol._stage2_train_hit_steps == 2,
+                 "Stage 2 train_score ignores eval tolerance miss steps")
     return ok
 
 
@@ -1013,6 +1273,46 @@ def test_success_mode_score_consistency() -> bool:
         ok &= _check(train_success and not eval_success,
                      f"Stage {stage}: success_mode only selects train_score or eval_score")
 
+    return ok
+
+
+def test_stage_local_lr_schedule() -> bool:
+    _header("Test 22d: Stage-Local LR Schedule")
+    ok = True
+    cfg = TrainConfig()
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = cfg
+
+    stage_start = 60_000_000
+    stage_budget = 120_000_000
+    stage_end = stage_start + stage_budget
+    schedule = trainer._make_lr_schedule(
+        stage_start_step=stage_start,
+        stage_budget=stage_budget,
+    )
+
+    def _lr_at_global_step(global_step: int) -> float:
+        progress_remaining = 1.0 - float(global_step) / float(stage_end)
+        return float(schedule(progress_remaining))
+
+    base_lr = float(cfg.sac.learning_rate)
+    min_lr = base_lr * float(cfg.sac.lr_decay_min_ratio)
+    mid_lr = _lr_at_global_step(114_000_000)
+
+    ok &= _check(np.isclose(_lr_at_global_step(60_000_000), base_lr),
+                 "Stage-local LR starts at base learning rate after resume")
+    ok &= _check(np.isclose(_lr_at_global_step(96_000_000), base_lr),
+                 "Stage-local LR remains constant until 30% of current stage")
+    ok &= _check(min_lr < mid_lr < base_lr,
+                 f"Stage-local LR decays inside cosine window  [got {mid_lr:.8f}]")
+    ok &= _check(np.isclose(_lr_at_global_step(132_000_000), min_lr),
+                 "Stage-local LR reaches minimum at 60% of current stage")
+    ok &= _check(np.isclose(_lr_at_global_step(180_000_000), min_lr),
+                 "Stage-local LR remains at minimum through stage end")
+    ok &= _check(np.isclose(_lr_at_global_step(0), base_lr),
+                 "Stage-local LR clamps progress before stage start")
+    ok &= _check(np.isclose(_lr_at_global_step(240_000_000), min_lr),
+                 "Stage-local LR clamps progress after stage end")
     return ok
 
 
@@ -1211,7 +1511,7 @@ def main():
         "Stage-2 reward shape":  test_stage2_strategy_reward_shape(),
         "Hold reward independence": test_hold_reward_space_independence(),
         "Success mode score consistency": test_success_mode_score_consistency(),
-        "Stage-2 hold refund":   True,  # removed: hold/refund mechanism replaced by wide-sigma peak layer
+        "Stage-local LR schedule": test_stage_local_lr_schedule(),
         "Eval fixed controls":    test_eval_fixed_controls_config(),
         "Stage-2 platform motion": test_stage2_platform_motion_continuity(),
         "Stage-2 velocity obs":   test_stage2_platform_velocity_observation(),

@@ -104,7 +104,6 @@ conda run --no-capture-output -n drone_rl python scripts\evaluate.py --model <pa
 | `--traj_out_dir` | `output/data/eval_traj` | 轨迹输出根目录 |
 | `--traj_stride` | `1` | 每隔多少 step 记录一行轨迹 |
 | `--traj_realtime_refresh` | `10` | 实时图每隔多少 step 刷新 |
-| `--save_traj` | 开关 | 旧版轨迹保存开关，保留兼容；新流程优先用 `--traj_enable` |
 
 ### 常用命令示例
 

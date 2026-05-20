@@ -112,7 +112,6 @@ def fig_reward_curve(ep: pd.DataFrame, out: str, window: int = 100) -> None:
 def fig_success_rate(ep: pd.DataFrame, out: str, window: int = 50) -> None:
     """各阶段滚动成功率。"""
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.axhline(0.8, color="gray", ls="--", lw=1, label="Advance threshold (80%)")
 
     for stage, color in STAGE_COLORS.items():
         sub = ep[ep["stage"] == stage]

@@ -210,12 +210,6 @@ class BaseDroneLandingEnv(gym.Env, ABC):
     # 课程管理（Trainer 手动切换阶段时调用）
     # =========================================================================
 
-    def set_curriculum_stage(self, stage: int) -> None:
-        """兼容旧训练工具的包装方法。"""
-        from curriculum.strategies import create_strategy
-
-        self.set_strategy(create_strategy(stage, self.config))
-
     def get_curriculum_stage(self) -> int:
         return int(self.strategy.stage_id())
 
@@ -398,7 +392,6 @@ class BaseDroneLandingEnv(gym.Env, ABC):
             episode_metrics = self.strategy.get_episode_metrics(self)
             info.update({
                 "success": bool(self._episode_success),
-                "episode_stage": int(self.curriculum_stage),
             })
             info.update(episode_metrics)
             info["episode"] = {
@@ -406,7 +399,6 @@ class BaseDroneLandingEnv(gym.Env, ABC):
                 "l": int(self._step_count),
                 "success": bool(self._episode_success),
                 "stage": self.curriculum_stage,
-                "episode_stage": int(self.curriculum_stage),
             }
             info["episode"].update(episode_metrics)
 

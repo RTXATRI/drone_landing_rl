@@ -37,7 +37,9 @@
 - `EVAL_SCORE_*`：评估得分空间，用于 `eval_score` 和环境级连续保持步数。
 - `HOLD_REWARD_*`：保持奖励空间，只在 `compute_reward()` 的保持奖励块附近定义，用于 `reward/hold` 和 `reward/hold_break`。
 
-Stage 1/2 的默认数值保持旧行为：训练空间较宽，评估空间保持原标准，奖励空间默认等于旧评估空间但可以独立调参。训练和评估环境都会按同一套策略参数计算 `train_score` 和 `eval_score`，`success_mode="eval"` 只改变 episode 成功判定选用哪个分数。新增课程时，训练/评估参数属于多方法共享常量，应放在类顶部；奖励塑形参数应放在 `compute_reward()` 对应奖励块附近。
+训练和评估环境都会按同一套策略参数计算 `train_score` 和 `eval_score`，`success_mode="eval"` 只改变 episode 成功判定选用哪个分数。新增课程时，训练/评估参数属于多方法共享常量，应放在类顶部；奖励塑形参数应放在 `compute_reward()` 对应奖励块附近。
+
+悬停课程的评分速度条件拆成水平和垂直两部分。Stage 1 是静态平台，水平速度按无人机自身 XY 速度的绝对阈值判定；Stage 2 是移动平台，水平速度按无人机与平台 XY 速度的大小误差和方向误差判定。垂直速度作为独立严格条件判定，不混入水平速度误差。各课程独立实现这些判定，不把阶段特有语义抽到基础类。
 
 ## Stage 2 平台观测
 
@@ -47,7 +49,7 @@ Stage 2 作为 Python 预训练，平台速度直接来自仿真真实速度，�
 
 训练后续课程时，可通过 `env.enable_mix_training(ratio)` 启用穿插训练。每回合以 `ratio` 概率随机选择前一课程策略，其余使用当前课程策略。策略实例通过 `env._strategies` 字典按 `stage_id` 缓存，`env._nominal_stage` 记录真实训练阶段不受混合影响。
 
-`CurriculumCallback` 自动过滤混合回合（`episode_stage != current_stage` 时跳过），避免滚动指标被稀释。TensorBoard 中 `curriculum/actual_mix_ratio` 显示实际混合比例。
+`CurriculumCallback` 自动过滤混合回合（`stage != current_stage` 时跳过），避免滚动指标被稀释。TensorBoard 中 `curriculum/actual_mix_ratio` 显示实际混合比例。
 
 ## 新增课程指南
 
