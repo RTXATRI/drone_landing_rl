@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from stable_baselines3 import SAC
     from stable_baselines3.common.vec_env import VecMonitor
     from training.model_selection import BestModelCandidateCallback
+    from training.callbacks import StageProgressCallback
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class Trainer:
         self.start_stage  = start_stage
         self.mix_ratio    = float(mix_ratio)
         self._best_model_cb: Optional["BestModelCandidateCallback"] = None
+        self._stage_progress_cb: Optional["StageProgressCallback"] = None
 
         # 日志设置
         run_dir = os.path.join(train_config.log_dir, train_config.exp_name)
@@ -130,6 +132,13 @@ class Trainer:
                         start_step=stage_start_step,
                         stage_budget=stage_steps,
                     )
+                if self._stage_progress_cb is not None:
+                    self._stage_progress_cb.start_stage(
+                        stage=stage,
+                        label=STAGE_SHORT_LABELS[stage],
+                        start_step=stage_start_step,
+                        stage_budget=stage_steps,
+                    )
                 logger.info("-" * 60)
                 logger.info(
                     f"Stage {stage} {STAGE_SHORT_LABELS[stage]} started | "
@@ -150,7 +159,7 @@ class Trainer:
                     log_interval = self.cfg.sb3_log_interval_episodes,
                     tb_log_name = self.cfg.exp_name,
                     reset_num_timesteps = reset_num_timesteps,
-                    progress_bar = True,
+                    progress_bar = False,
                 )
                 reset_num_timesteps = False
 
@@ -331,6 +340,7 @@ class Trainer:
             CheckpointCallback,
             CSVLoggingCallback,
             CurriculumCallback,
+            StageProgressCallback,
         )
 
         n_envs = max(1, int(self.cfg.n_envs))
@@ -355,6 +365,8 @@ class Trainer:
         callbacks = [curriculum_cb, csv_cb, ckpt_cb]
         if self._best_model_cb is not None:
             callbacks.append(self._best_model_cb)
+        self._stage_progress_cb = StageProgressCallback(verbose=1)
+        callbacks.append(self._stage_progress_cb)
         return callbacks
 
     def _evaluate_best_model_candidates(self, stage: int) -> None:

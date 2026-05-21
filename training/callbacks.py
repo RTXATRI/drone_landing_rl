@@ -2,7 +2,9 @@
 """
 自定义 Stable-Baselines3 callbacks。
 
-训练器会组合三个 callback：
+训练器会组合多个 callback：
+
+  StageProgressCallback — 用自管 Rich 风格 tqdm 显示当前课程阶段训练进度。
 
   CurriculumCallback     — 跟踪 episode 结果，并把手动课程阶段指标写入 TensorBoard。
 
@@ -17,6 +19,8 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import sys
+import warnings
 from typing import Dict, List
 
 from stable_baselines3.common.callbacks import BaseCallback
@@ -26,6 +30,20 @@ from curriculum.strategies import create_strategy
 from configs.env_config import EnvConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _progress_tqdm():
+    """Return a Rich-styled tqdm when available, otherwise plain tqdm."""
+    try:
+        from tqdm import TqdmExperimentalWarning
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", TqdmExperimentalWarning)
+            from tqdm.rich import tqdm
+        return tqdm
+    except Exception:
+        from tqdm import tqdm
+        return tqdm
 
 
 def _log_file_only(record_logger: logging.Logger, message: str, level: int = logging.INFO) -> None:
@@ -47,14 +65,14 @@ def _log_file_only(record_logger: logging.Logger, message: str, level: int = log
 
 def _write_progress_line(message: str) -> None:
     """
-    打印状态行，同时不破坏 tqdm/rich 进度条。
+    打印状态行，同时不破坏 tqdm 进度条。
 
-    learn() 运行时终端由 SB3 的进度条接管。直接 logger.info() 会写到 stdout，
-    可能和进度条挤在同一行；tqdm.write() 会打印到进度条上方，并让进度条自行重绘。
+    训练和复评进度条统一写到 stdout。直接 logger.info() 可能和进度条
+    挤在同一行；tqdm.write() 会打印到进度条上方，并让进度条自行重绘。
     """
     try:
-        from tqdm import tqdm
-        tqdm.write(message)
+        tqdm = _progress_tqdm()
+        tqdm.write(message, file=sys.stdout)
     except Exception:
         print(message, flush=True)
     _log_file_only(logger, message)
@@ -89,6 +107,109 @@ def _format_step_compact(step: int) -> str:
     if abs(step) >= 1_000:
         return f"{step / 1_000:.1f}k"
     return str(step)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0. 训练阶段进度条
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StageProgressCallback(BaseCallback):
+    """使用自管 Rich 风格进度条显示当前课程阶段训练进度。"""
+
+    def __init__(self, verbose: int = 1):
+        super().__init__(verbose)
+        self._stage = 1
+        self._label = "Stage"
+        self._stage_start_step = 0
+        self._stage_budget = 1
+        self._displayed_steps = 0
+        self._bar = None
+        self._interactive = False
+
+    def start_stage(
+        self,
+        *,
+        stage: int,
+        label: str,
+        start_step: int,
+        stage_budget: int,
+    ) -> None:
+        self._stage = int(stage)
+        self._label = str(label)
+        self._stage_start_step = int(start_step)
+        self._stage_budget = max(1, int(stage_budget))
+        self._displayed_steps = 0
+
+    def _progress_value(self) -> int:
+        elapsed = int(self.num_timesteps) - int(self._stage_start_step)
+        return max(0, min(int(self._stage_budget), elapsed))
+
+    def _on_training_start(self) -> None:
+        self._displayed_steps = self._progress_value()
+        self._interactive = bool(sys.stdout.isatty())
+        if not self._interactive:
+            if self.verbose >= 1:
+                logger.info(
+                    "Stage %s %s progress: 0/%s timesteps",
+                    self._stage,
+                    self._label,
+                    f"{self._stage_budget:,}",
+                )
+            return
+
+        try:
+            tqdm = _progress_tqdm()
+
+            self._bar = tqdm(
+                total=self._stage_budget,
+                initial=self._displayed_steps,
+                desc=f"Stage {self._stage} {self._label}",
+                unit="steps",
+                dynamic_ncols=True,
+                leave=True,
+                file=sys.stdout,
+                mininterval=0.5,
+            )
+        except Exception:
+            self._bar = None
+            self._interactive = False
+            if self.verbose >= 1:
+                logger.info(
+                    "Stage %s %s progress: 0/%s timesteps",
+                    self._stage,
+                    self._label,
+                    f"{self._stage_budget:,}",
+                )
+
+    def _on_step(self) -> bool:
+        current = self._progress_value()
+        delta = current - self._displayed_steps
+        if delta > 0:
+            self._displayed_steps = current
+            if self._bar is not None:
+                self._bar.update(delta)
+        return True
+
+    def _on_training_end(self) -> None:
+        current = self._progress_value()
+        delta = current - self._displayed_steps
+        if delta > 0:
+            self._displayed_steps = current
+            if self._bar is not None:
+                self._bar.update(delta)
+
+        if self._bar is not None:
+            self._bar.refresh()
+            self._bar.close()
+            self._bar = None
+        elif self.verbose >= 1:
+            logger.info(
+                "Stage %s %s progress: %s/%s timesteps",
+                self._stage,
+                self._label,
+                f"{self._displayed_steps:,}",
+                f"{self._stage_budget:,}",
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

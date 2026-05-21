@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, TYPE_CHECKING
 
@@ -26,6 +27,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FAILURE_TERMINATIONS = {"oob", "below_ground", "crashed"}
+
+
+def _progress_tqdm():
+    """Return a Rich-styled tqdm when available, otherwise plain tqdm."""
+    try:
+        from tqdm import TqdmExperimentalWarning
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", TqdmExperimentalWarning)
+            from tqdm.rich import tqdm
+        return tqdm
+    except Exception:
+        from tqdm import tqdm
+        return tqdm
 
 
 def _log_file_only(record_logger: logging.Logger, message: str, level: int = logging.INFO) -> None:
@@ -269,11 +284,13 @@ class BestModelCandidateCallback(BaseCallback):
             )
             self._grid_candidates[(self._stage, self._next_grid_interval)] = candidate
             if self.verbose >= 1:
-                logger.info(
-                    "Best-model grid candidate saved: stage=%s interval=%s ts=%s",
-                    self._stage,
-                    self._next_grid_interval,
-                    self.num_timesteps,
+                _log_file_only(
+                    logger,
+                    (
+                        "Best-model grid candidate saved: "
+                        f"stage={self._stage} interval={self._next_grid_interval} "
+                        f"ts={self.num_timesteps}"
+                    ),
                 )
             self._next_grid_interval += 1
 
@@ -364,16 +381,20 @@ class BestModelEvalProgress:
         stage: int,
         candidates_total: int,
         episodes_per_candidate: int,
+        train_weight: float = 0.5,
+        eval_weight: float = 0.5,
     ):
         self.stage = int(stage)
         self.candidates_total = max(0, int(candidates_total))
         self.episodes_per_candidate = max(1, int(episodes_per_candidate))
+        self.train_weight = float(train_weight)
+        self.eval_weight = float(eval_weight)
         self.total_episodes = self.candidates_total * self.episodes_per_candidate
         self.completed_episodes = 0
 
         self._bar = None
         self._tqdm_cls = None
-        self._interactive = bool(sys.stderr.isatty())
+        self._interactive = bool(sys.stdout.isatty())
         self._started_at = 0.0
         self._candidate_started_at = 0.0
         self._candidate_index = 0
@@ -392,14 +413,15 @@ class BestModelEvalProgress:
         self._started_at = time.monotonic()
         if self._interactive:
             try:
-                from tqdm import tqdm
-
+                tqdm = _progress_tqdm()
                 self._tqdm_cls = tqdm
                 self._bar = tqdm(
                     total=self.total_episodes,
                     desc=f"Stage {self.stage} best eval",
                     unit="eps",
                     dynamic_ncols=True,
+                    leave=True,
+                    file=sys.stdout,
                     mininterval=0.5,
                 )
             except Exception:
@@ -466,24 +488,28 @@ class BestModelEvalProgress:
                 self._best_label = f"{marker}:{float(combined):.2f}"
 
         elapsed = max(0.0, time.monotonic() - self._candidate_started_at)
+        candidate_tag = "candidate"
+        if candidate is not None:
+            candidate_tag = f"{candidate.kind}@{candidate.timestep}"
+
         message = (
             f"[{self._candidate_index}/{self.candidates_total}] {marker} "
-            f"combined={float(combined):.2f} "
-            f"train={float(summary['avg_train_score']):.2f} "
-            f"eval={float(summary['avg_eval_score']):.2f} "
-            f"sr={float(summary['success_rate']):.1%} "
+            f"score={float(combined):.2f} "
+            f"train={float(summary['avg_train_score']):.1f} "
+            f"eval={float(summary['avg_eval_score']):.1f} "
             f"fail={int(summary['failure_count'])} "
-            f"avg_len={float(summary['avg_length']):.0f} "
-            f"time={elapsed:.1f}s"
+            f"time={elapsed:.1f}s "
+            f"{candidate_tag}"
         )
-        if candidate is not None:
-            message += (
-                f" kind={candidate.kind} ts={candidate.timestep:010d}"
-            )
+        file_message = (
+            f"{message} "
+            f"sr={float(summary['success_rate']):.1%} "
+            f"avg_len={float(summary['avg_length']):.0f}"
+        )
 
         if self._interactive and self._tqdm_cls is not None:
-            self._tqdm_cls.write(message)
-            _log_file_only(logger, message)
+            self._tqdm_cls.write(message, file=sys.stdout)
+            _log_file_only(logger, file_message)
         else:
             logger.info("%s | %s", self._noninteractive_prefix(), message)
 
@@ -505,30 +531,21 @@ class BestModelEvalProgress:
         if self._bar is None:
             return
 
-        candidate = self._candidate
-        if candidate is None:
-            candidate_text = f"cand={self._candidate_index}/{self.candidates_total}"
-        else:
-            candidate_text = (
-                f"cand={self._candidate_index}/{self.candidates_total} "
-                f"kind={candidate.kind} ts={candidate.timestep:010d}"
-            )
-
         if self._current_count > 0:
             avg_train = self._current_train_total / self._current_count
             avg_eval = self._current_eval_total / self._current_count
-            sr = self._current_success_total / self._current_count
         else:
             avg_train = 0.0
             avg_eval = 0.0
-            sr = 0.0
+
+        current_score = avg_train * self.train_weight + avg_eval * self.eval_weight
 
         postfix = (
-            f"{candidate_text} "
-            f"cand_ep={self._current_count}/{self.episodes_per_candidate} "
+            f"cand={self._candidate_index}/{self.candidates_total} "
+            f"ep={self._current_count}/{self.episodes_per_candidate} "
             f"best={self._best_label} "
-            f"current=train={avg_train:.1f} eval={avg_eval:.1f} "
-            f"sr={sr:.1%} fail={self._current_failure_count}"
+            f"cur={current_score:.2f} "
+            f"fail={self._current_failure_count}"
         )
         self._bar.set_postfix_str(postfix, refresh=False)
 
@@ -699,6 +716,8 @@ def evaluate_stage_candidates(
             stage=stage,
             candidates_total=len(valid_candidates),
             episodes_per_candidate=eval_episodes,
+            train_weight=train_weight,
+            eval_weight=eval_weight,
         ) as progress:
             for idx, candidate in enumerate(valid_candidates, start=1):
                 progress.on_candidate_start(idx, candidate)

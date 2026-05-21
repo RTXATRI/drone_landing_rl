@@ -9,7 +9,61 @@ Windows 的 SubprocVecEnv 使用 spawn 时会在 worker 中反序列化这些闭
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
+
 from configs.env_config import EnvConfig
+
+
+@contextlib.contextmanager
+def _suppress_stdout_stderr():
+    """Temporarily suppress Python and C-extension stdout/stderr noise."""
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            stdout_fd = os.dup(1)
+            try:
+                stderr_fd = os.dup(2)
+            except OSError:
+                os.close(stdout_fd)
+                raise
+        except OSError:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                yield
+            return
+
+        try:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            sys.stdout = devnull
+            sys.stderr = devnull
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            try:
+                os.dup2(stdout_fd, 1)
+            except OSError:
+                pass
+            finally:
+                os.close(stdout_fd)
+            try:
+                os.dup2(stderr_fd, 2)
+            except OSError:
+                pass
+            finally:
+                os.close(stderr_fd)
+
+
+def _quiet_import_drone_env():
+    """Import DroneLandingEnv while hiding PyBullet's native build-time banner."""
+    with _suppress_stdout_stderr():
+        from envs.drone_landing_env import DroneLandingEnv
+    return DroneLandingEnv
 
 
 def make_training_env_fn(env_config: EnvConfig, rank: int, seed: int, stage: int):
@@ -19,7 +73,8 @@ def make_training_env_fn(env_config: EnvConfig, rank: int, seed: int, stage: int
 
     def _init():
         from curriculum.strategies import create_strategy
-        from envs.drone_landing_env import DroneLandingEnv
+
+        DroneLandingEnv = _quiet_import_drone_env()
 
         env = DroneLandingEnv(
             env_config,
@@ -38,7 +93,8 @@ def make_eval_env_fn(env_config: EnvConfig, rank: int, seed: int, stage: int):
 
     def _init():
         from curriculum.strategies import create_strategy
-        from envs.drone_landing_env import DroneLandingEnv
+
+        DroneLandingEnv = _quiet_import_drone_env()
 
         env = DroneLandingEnv(
             env_config,
