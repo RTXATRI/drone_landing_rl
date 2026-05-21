@@ -43,6 +43,13 @@ sys.path.insert(0, ROOT)
 from configs.env_config import EnvConfig
 from curriculum.strategies import create_strategy, is_hover_stage, registered_stage_ids
 from envs.drone_landing_env import DroneLandingEnv
+from utils.distance_metrics import (
+    AVG_MIN_DIST_ENTRY_HORIZ,
+    AVG_MIN_DIST_ENTRY_VERT,
+    AVG_MIN_DIST_ZERO_DEFAULT,
+    avg_min_dist_score as compute_avg_min_dist_score,
+    min_dist_score as compute_min_dist_score,
+)
 
 RENDER_SPEED_DEFAULT = 1.0
 RENDER_SPEED_MIN = 1.0
@@ -52,12 +59,6 @@ EVAL_HOVER_HEIGHT_DEFAULT = 5.0
 EVAL_V_XY_MAX_DEFAULT = 10.0
 EVAL_V_Z_UP_MAX_DEFAULT = 3.0
 EVAL_V_Z_DOWN_MAX_DEFAULT = 2.0
-AVG_MINDIST_ENTRY_HORIZ = 0.50
-AVG_MINDIST_ENTRY_VERT = 0.50
-AVG_MINDIST_ZERO_DEFAULT = 0.20
-DIST_SCORE_FULL = 0.005
-MINDIST_SCORE_ZERO = 0.050
-AVG_MINDIST_SCORE_ZEROS = (0.20, 0.15, 0.10, 0.08)
 
 TRAJ_ENABLE_DEFAULT = False
 TRAJ_PLOT_DEFAULT = False
@@ -127,7 +128,7 @@ TRAJ_EP_SUMMARY_COLS = [
     "avg_min_dist",
     "avg_min_dist_valid",
     "min_dist_score",
-    "avg_min_dist_score_z020",
+    "avg_min_dist_score",
     "sim_time_sec",
     "wall_time_sec",
     "sim_to_real_rate",
@@ -388,18 +389,6 @@ def sanitize_positive_int(value: int, default: int, name: str) -> int:
     return v
 
 
-def distance_score(distance: float, *, full: float, zero: float) -> float:
-    """Map a distance to a 0-100 score with a linear falloff."""
-    if not np.isfinite(distance):
-        return 0.0
-    d = float(distance)
-    if d <= full:
-        return 100.0
-    if d >= zero:
-        return 0.0
-    return float(100.0 * (zero - d) / (zero - full))
-
-
 def _stat(values: List[float], fn: str) -> float:
     if not values:
         return 0.0
@@ -631,9 +620,7 @@ def evaluate_stage(
     successes, rewards, lengths, dists = [], [], [], []
     avg_min_dists, avg_min_dist_valids = [], []
     min_dist_scores = []
-    avg_min_dist_scores_by_zero = {
-        zero: [] for zero in AVG_MINDIST_SCORE_ZEROS
-    }
+    avg_min_dist_scores = []
     sim_times, wall_times, sim_to_real_rates = [], [], []
     traj_episode_rows: List[Dict] = []
     traj_episode_csv_paths: List[str] = []
@@ -727,8 +714,8 @@ def evaluate_stage(
 
                 if (
                     not avg_min_dist_active
-                    and horiz_err <= AVG_MINDIST_ENTRY_HORIZ
-                    and vert_err <= AVG_MINDIST_ENTRY_VERT
+                    and horiz_err <= AVG_MIN_DIST_ENTRY_HORIZ
+                    and vert_err <= AVG_MIN_DIST_ENTRY_VERT
                 ):
                     avg_min_dist_active = True
                 if avg_min_dist_active and np.isfinite(step_dist):
@@ -901,18 +888,13 @@ def evaluate_stage(
             avg_min_dist_valid = avg_min_dist_count > 0
             avg_min_dist = (
                 avg_min_dist_sum / float(avg_min_dist_count)
-                if avg_min_dist_valid else AVG_MINDIST_ZERO_DEFAULT
+                if avg_min_dist_valid else AVG_MIN_DIST_ZERO_DEFAULT
             )
-            min_dist_score = distance_score(
-                min_d, full=DIST_SCORE_FULL, zero=MINDIST_SCORE_ZERO
+            min_dist_score = compute_min_dist_score(min_d)
+            avg_min_dist_score = compute_avg_min_dist_score(
+                avg_min_dist,
+                avg_min_dist_valid,
             )
-            avg_min_dist_scores = {
-                zero: (
-                    distance_score(avg_min_dist, full=DIST_SCORE_FULL, zero=zero)
-                    if avg_min_dist_valid else 0.0
-                )
-                for zero in AVG_MINDIST_SCORE_ZEROS
-            }
 
             ep_wall = max(time.perf_counter() - ep_wall_t0, 1e-9)
             ep_sim = ep_len * env_config.episode.dt
@@ -925,8 +907,7 @@ def evaluate_stage(
             avg_min_dists.append(avg_min_dist)
             avg_min_dist_valids.append(float(avg_min_dist_valid))
             min_dist_scores.append(min_dist_score)
-            for zero, score in avg_min_dist_scores.items():
-                avg_min_dist_scores_by_zero[zero].append(score)
+            avg_min_dist_scores.append(avg_min_dist_score)
             sim_times.append(ep_sim)
             wall_times.append(ep_wall)
             sim_to_real_rates.append(ep_rate)
@@ -946,9 +927,7 @@ def evaluate_stage(
                     "avg_min_dist": round(float(avg_min_dist), 6),
                     "avg_min_dist_valid": int(avg_min_dist_valid),
                     "min_dist_score": round(float(min_dist_score), 3),
-                    "avg_min_dist_score_z020": round(
-                        float(avg_min_dist_scores.get(0.20, 0.0)), 3
-                    ),
+                    "avg_min_dist_score": round(float(avg_min_dist_score), 3),
                     "sim_time_sec": round(float(ep_sim), 6),
                     "wall_time_sec": round(float(ep_wall), 6),
                     "sim_to_real_rate": round(float(ep_rate), 6),
@@ -963,6 +942,7 @@ def evaluate_stage(
                 f"  Ep {ep+1:3d}/{n_episodes} | {status} | "
                 f"R={ep_r:+8.2f} | L={ep_len:4d} | minDist={min_d:.3f}m"
                 f" | avgMinDist={avg_min_dist:.3f}m"
+                f" | avgScore={avg_min_dist_score:.1f}"
                 f" | avgValid={int(avg_min_dist_valid)}"
                 f" | rate={ep_rate:.2f}x"
                 f"{eval_suffix}"
@@ -993,13 +973,11 @@ def evaluate_stage(
         "max_avg_min_dist": _stat(avg_min_dists, "max"),
         "avg_min_dist_valid_rate": float(np.mean(avg_min_dist_valids)),
         "mean_min_dist_score": float(np.mean(min_dist_scores)),
+        "mean_avg_min_dist_score": float(np.mean(avg_min_dist_scores)),
         "mean_sim_time_sec": float(np.mean(sim_times)),
         "mean_wall_time_sec": float(np.mean(wall_times)),
         "mean_sim_to_real_rate": float(np.mean(sim_to_real_rates)),
     }
-    for zero, scores in avg_min_dist_scores_by_zero.items():
-        suffix = f"z{int(round(zero * 1000)):03d}"
-        summary[f"mean_avg_min_dist_score_{suffix}"] = float(np.mean(scores))
 
     if traj_enable and traj_stage_dir:
         summary_csv_path = os.path.join(traj_stage_dir, "episode_summary.csv")
@@ -1007,7 +985,7 @@ def evaluate_stage(
             "episode", "stage", "success", "reward", "length",
             "train_score", "eval_score",
             "min_dist", "avg_min_dist", "avg_min_dist_valid",
-            "min_dist_score", "avg_min_dist_score_z020",
+            "min_dist_score", "avg_min_dist_score",
             "sim_time_sec", "wall_time_sec",
             "sim_to_real_rate", "traj_csv",
         ]
@@ -1059,14 +1037,8 @@ def print_summary(results: list) -> None:
             f"median={r['median_avg_min_dist']:.4f}m, "
             f"p90={r['p90_avg_min_dist']:.4f}m, "
             f"max={r['max_avg_min_dist']:.4f}m, "
-            f"valid={r['avg_min_dist_valid_rate']:.1%}"
-        )
-        print(
-            "           avgMinDist scores: "
-            f"z0.20={r['mean_avg_min_dist_score_z200']:.1f}, "
-            f"z0.15={r['mean_avg_min_dist_score_z150']:.1f}, "
-            f"z0.10={r['mean_avg_min_dist_score_z100']:.1f}, "
-            f"z0.08={r['mean_avg_min_dist_score_z080']:.1f}"
+            f"valid={r['avg_min_dist_valid_rate']:.1%}, "
+            f"score={r['mean_avg_min_dist_score']:.1f}"
         )
     print(f"{'='*60}\n")
 
