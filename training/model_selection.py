@@ -7,6 +7,8 @@ import logging
 import math
 import os
 import shutil
+import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, TYPE_CHECKING
 
@@ -24,6 +26,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FAILURE_TERMINATIONS = {"oob", "below_ground", "crashed"}
+
+
+def _log_file_only(record_logger: logging.Logger, message: str, level: int = logging.INFO) -> None:
+    """Write progress messages to file logs without colliding with tqdm output."""
+    root = logging.getLogger()
+    record = record_logger.makeRecord(
+        record_logger.name,
+        level,
+        __file__,
+        0,
+        message,
+        args=(),
+        exc_info=None,
+    )
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler) and level >= handler.level:
+            handler.handle(record)
 
 
 @dataclass
@@ -307,6 +326,213 @@ class BestModelCandidateCallback(BaseCallback):
         return True
 
 
+def _format_duration(seconds: float) -> str:
+    if not math.isfinite(float(seconds)) or seconds < 0.0:
+        return "--:--"
+    total = int(round(float(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _evaluated_sort_key(
+    *,
+    marker: str,
+    summary: dict,
+    combined: float,
+    candidate: ModelCandidate,
+) -> tuple:
+    marker_rank = 0 if marker == "clean" else 1
+    return (
+        marker_rank,
+        int(summary["failure_count"]),
+        -float(combined),
+        -float(summary["avg_eval_score"]),
+        -float(summary["avg_train_score"]),
+        -int(candidate.timestep),
+    )
+
+
+class BestModelEvalProgress:
+    """Real-time progress display for per-stage best-model reevaluation."""
+
+    def __init__(
+        self,
+        *,
+        stage: int,
+        candidates_total: int,
+        episodes_per_candidate: int,
+    ):
+        self.stage = int(stage)
+        self.candidates_total = max(0, int(candidates_total))
+        self.episodes_per_candidate = max(1, int(episodes_per_candidate))
+        self.total_episodes = self.candidates_total * self.episodes_per_candidate
+        self.completed_episodes = 0
+
+        self._bar = None
+        self._tqdm_cls = None
+        self._interactive = bool(sys.stderr.isatty())
+        self._started_at = 0.0
+        self._candidate_started_at = 0.0
+        self._candidate_index = 0
+        self._candidate: Optional[ModelCandidate] = None
+
+        self._current_count = 0
+        self._current_train_total = 0.0
+        self._current_eval_total = 0.0
+        self._current_success_total = 0.0
+        self._current_failure_count = 0
+
+        self._best_key: Optional[tuple] = None
+        self._best_label = "none"
+
+    def __enter__(self) -> "BestModelEvalProgress":
+        self._started_at = time.monotonic()
+        if self._interactive:
+            try:
+                from tqdm import tqdm
+
+                self._tqdm_cls = tqdm
+                self._bar = tqdm(
+                    total=self.total_episodes,
+                    desc=f"Stage {self.stage} best eval",
+                    unit="eps",
+                    dynamic_ncols=True,
+                    mininterval=0.5,
+                )
+            except Exception:
+                self._interactive = False
+                self._bar = None
+
+        if not self._interactive:
+            logger.info(
+                "Best-model eval progress: stage=%s candidates=%s "
+                "episodes_per_candidate=%s total_episodes=%s",
+                self.stage,
+                self.candidates_total,
+                self.episodes_per_candidate,
+                self.total_episodes,
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+
+    def on_candidate_start(self, index: int, candidate: ModelCandidate) -> None:
+        self._candidate_index = int(index)
+        self._candidate = candidate
+        self._candidate_started_at = time.monotonic()
+        self._current_count = 0
+        self._current_train_total = 0.0
+        self._current_eval_total = 0.0
+        self._current_success_total = 0.0
+        self._current_failure_count = 0
+        self._refresh_bar()
+
+    def on_episode(self, result: dict) -> None:
+        self.completed_episodes += 1
+        self._current_count += 1
+        self._current_train_total += float(result.get("train_score", 0.0))
+        self._current_eval_total += float(result.get("eval_score", 0.0))
+        self._current_success_total += float(result.get("success", False))
+        if bool(result.get("failure", False)):
+            self._current_failure_count += 1
+
+        if self._bar is not None:
+            self._bar.update(1)
+            self._refresh_bar()
+
+    def on_candidate_done(
+        self,
+        *,
+        summary: dict,
+        combined: float,
+        marker: str,
+    ) -> None:
+        candidate = self._candidate
+        if candidate is not None:
+            key = _evaluated_sort_key(
+                marker=marker,
+                summary=summary,
+                combined=combined,
+                candidate=candidate,
+            )
+            if self._best_key is None or key < self._best_key:
+                self._best_key = key
+                self._best_label = f"{marker}:{float(combined):.2f}"
+
+        elapsed = max(0.0, time.monotonic() - self._candidate_started_at)
+        message = (
+            f"[{self._candidate_index}/{self.candidates_total}] {marker} "
+            f"combined={float(combined):.2f} "
+            f"train={float(summary['avg_train_score']):.2f} "
+            f"eval={float(summary['avg_eval_score']):.2f} "
+            f"sr={float(summary['success_rate']):.1%} "
+            f"fail={int(summary['failure_count'])} "
+            f"avg_len={float(summary['avg_length']):.0f} "
+            f"time={elapsed:.1f}s"
+        )
+        if candidate is not None:
+            message += (
+                f" kind={candidate.kind} ts={candidate.timestep:010d}"
+            )
+
+        if self._interactive and self._tqdm_cls is not None:
+            self._tqdm_cls.write(message)
+            _log_file_only(logger, message)
+        else:
+            logger.info("%s | %s", self._noninteractive_prefix(), message)
+
+        self._refresh_bar()
+
+    def _noninteractive_prefix(self) -> str:
+        elapsed = max(time.monotonic() - self._started_at, 1e-9)
+        rate = self.completed_episodes / elapsed
+        remaining = self.total_episodes - self.completed_episodes
+        eta = _format_duration(remaining / rate) if rate > 0.0 else "--:--"
+        return (
+            "Best-model eval progress: "
+            f"{self._candidate_index}/{self.candidates_total} candidates | "
+            f"{self.completed_episodes}/{self.total_episodes} eps | "
+            f"{rate:.2f} ep/s | ETA {eta}"
+        )
+
+    def _refresh_bar(self) -> None:
+        if self._bar is None:
+            return
+
+        candidate = self._candidate
+        if candidate is None:
+            candidate_text = f"cand={self._candidate_index}/{self.candidates_total}"
+        else:
+            candidate_text = (
+                f"cand={self._candidate_index}/{self.candidates_total} "
+                f"kind={candidate.kind} ts={candidate.timestep:010d}"
+            )
+
+        if self._current_count > 0:
+            avg_train = self._current_train_total / self._current_count
+            avg_eval = self._current_eval_total / self._current_count
+            sr = self._current_success_total / self._current_count
+        else:
+            avg_train = 0.0
+            avg_eval = 0.0
+            sr = 0.0
+
+        postfix = (
+            f"{candidate_text} "
+            f"cand_ep={self._current_count}/{self.episodes_per_candidate} "
+            f"best={self._best_label} "
+            f"current=train={avg_train:.1f} eval={avg_eval:.1f} "
+            f"sr={sr:.1%} fail={self._current_failure_count}"
+        )
+        self._bar.set_postfix_str(postfix, refresh=False)
+
+
 def _build_eval_env(
     env_config: EnvConfig,
     *,
@@ -336,6 +562,7 @@ def _evaluate_loaded_model(
     *,
     n_episodes: int,
     seed: int,
+    progress: Optional[BestModelEvalProgress] = None,
 ) -> dict:
     model.set_env(vec_env)
     n_envs = int(vec_env.num_envs)
@@ -358,7 +585,7 @@ def _evaluate_loaded_model(
                     continue
                 episode_idx += 1
                 termination = str(info.get("termination", ep.get("termination", "none")))
-                results.append({
+                result = {
                     "episode": episode_idx,
                     "reward": float(ep.get("r", 0.0)),
                     "length": int(ep.get("l", 0)),
@@ -367,7 +594,10 @@ def _evaluate_loaded_model(
                     "eval_score": float(ep.get("eval_score", info.get("eval_score", 0.0))),
                     "termination": termination,
                     "failure": termination in FAILURE_TERMINATIONS,
-                })
+                }
+                results.append(result)
+                if progress is not None:
+                    progress.on_episode(result)
                 active[env_idx] = False
 
     if not results:
@@ -417,6 +647,20 @@ def evaluate_stage_candidates(
         )
         return []
 
+    valid_candidates: List[ModelCandidate] = []
+    for candidate in candidates:
+        if os.path.exists(candidate.path + ".zip"):
+            valid_candidates.append(candidate)
+        else:
+            logger.warning("Candidate zip missing; skipping: %s.zip", candidate.path)
+
+    if not valid_candidates:
+        logger.info(
+            "No existing best-model candidate zips found for stage %s; skipping evaluation.",
+            stage,
+        )
+        return []
+
     eval_episodes = max(1, int(train_config.best_model_eval_episodes))
     configured_envs = int(train_config.best_model_eval_envs_by_stage.get(stage, 1))
     n_envs = max(1, min(configured_envs, eval_episodes))
@@ -428,7 +672,7 @@ def evaluate_stage_candidates(
 
     logger.info(
         "Evaluating %s best-model candidates for stage %s: episodes=%s eval_envs=%s",
-        len(candidates),
+        len(valid_candidates),
         stage,
         eval_episodes,
         n_envs,
@@ -451,41 +695,51 @@ def evaluate_stage_candidates(
         return []
 
     try:
-        for idx, candidate in enumerate(candidates, start=1):
-            if not os.path.exists(candidate.path + ".zip"):
-                logger.warning("Candidate zip missing; skipping: %s.zip", candidate.path)
-                continue
-            try:
-                model = SAC.load(candidate.path, env=eval_env, device=device)
-                summary = _evaluate_loaded_model(
-                    model,
-                    eval_env,
-                    n_episodes=eval_episodes,
-                    seed=seed_base,
+        with BestModelEvalProgress(
+            stage=stage,
+            candidates_total=len(valid_candidates),
+            episodes_per_candidate=eval_episodes,
+        ) as progress:
+            for idx, candidate in enumerate(valid_candidates, start=1):
+                progress.on_candidate_start(idx, candidate)
+                try:
+                    model = SAC.load(candidate.path, env=eval_env, device=device)
+                    summary = _evaluate_loaded_model(
+                        model,
+                        eval_env,
+                        n_episodes=eval_episodes,
+                        seed=seed_base,
+                        progress=progress,
+                    )
+                except NotImplementedError:
+                    logger.warning(
+                        "Stage %s evaluation is not implemented; skipping best-model evaluation.",
+                        stage,
+                    )
+                    return []
+                combined = (
+                    summary["avg_train_score"] * train_weight
+                    + summary["avg_eval_score"] * eval_weight
                 )
-            except NotImplementedError:
-                logger.warning(
-                    "Stage %s evaluation is not implemented; skipping best-model evaluation.",
-                    stage,
+                marker = "fail" if summary["failure_count"] > 0 else "clean"
+                raw_rows.append({
+                    "candidate": candidate,
+                    "summary": summary,
+                    "combined": combined,
+                    "marker": marker,
+                    "original_index": idx,
+                })
+                progress.on_candidate_done(
+                    summary=summary,
+                    combined=combined,
+                    marker=marker,
                 )
-                return []
-            combined = (
-                summary["avg_train_score"] * train_weight
-                + summary["avg_eval_score"] * eval_weight
-            )
-            raw_rows.append({
-                "candidate": candidate,
-                "summary": summary,
-                "combined": combined,
-                "marker": "fail" if summary["failure_count"] > 0 else "clean",
-                "original_index": idx,
-            })
-            del model
-            gc.collect()
-            import torch
+                del model
+                gc.collect()
+                import torch
 
-            if str(device).startswith("cuda") and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                if str(device).startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
     finally:
         eval_env.close()
 
@@ -493,14 +747,11 @@ def evaluate_stage_candidates(
         return []
 
     def _sort_key(row: dict):
-        marker_rank = 0 if row["marker"] == "clean" else 1
-        return (
-            marker_rank,
-            row["summary"]["failure_count"],
-            -row["combined"],
-            -row["summary"]["avg_eval_score"],
-            -row["summary"]["avg_train_score"],
-            -row["candidate"].timestep,
+        return _evaluated_sort_key(
+            marker=row["marker"],
+            summary=row["summary"],
+            combined=row["combined"],
+            candidate=row["candidate"],
         )
 
     raw_rows.sort(key=_sort_key)

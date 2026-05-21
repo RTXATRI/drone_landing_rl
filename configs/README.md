@@ -1,6 +1,6 @@
 # configs 目录说明
 
-本目录集中保存工程配置，目的是让环境参数、训练参数和课程参数可以在不改核心逻辑的情况下调整。
+本目录集中保存工程配置，目的是让环境参数和训练参数可以在不改核心逻辑的情况下调整。
 
 ## 文件职责
 
@@ -13,7 +13,7 @@
 
 - 观测维度和归一化：`ObservationConfig`
 - PyBullet 预训练扰动：`DisturbanceConfig`
-- 降落平台尺寸与运动：`PlatformConfig`
+- 降落平台尺寸和降落容差：`PlatformConfig`
 - episode 时长、初始出生范围和出界边界：`EpisodeConfig`
 
 常见训练调参优先修改 `TrainConfig`：

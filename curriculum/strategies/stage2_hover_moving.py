@@ -121,10 +121,7 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     # ── 场景设置 ──────────────────────────────────────────────────────────────
 
     def setup_scene(self, env, rng: np.random.Generator) -> None:
-        cfg = self.config.episode
-        height = float(rng.uniform(cfg.hover_height_min, cfg.hover_height_max))
-        self.set_hover_height(height)
-        env._current_hover_height = height
+        self._apply_hover_height(env, self._sample_hover_height(rng))
 
         # 选择运动策略
         if self._motion_override is not None:

@@ -51,6 +51,7 @@ class CurriculumStrategy(ABC):
     def __init__(self, env_config: EnvConfig):
         self.config = env_config
         self._hover_height = 2.0
+        self._hover_height_range_override: Tuple[float, float] | None = None
 
     @abstractmethod
     def stage_id(self) -> int:
@@ -197,19 +198,51 @@ class CurriculumStrategy(ABC):
     def get_hover_height(self) -> float:
         return float(self._hover_height)
 
+    def set_hover_height_range(self, min_height: float, max_height: float) -> None:
+        """覆盖悬停类策略的目标高度采样范围。"""
+        lo = float(min_height)
+        hi = float(max_height)
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo <= 0.0 or hi <= 0.0:
+            raise ValueError("hover height range must contain finite positive values.")
+        if lo > hi:
+            raise ValueError("hover height min cannot exceed max.")
+        self._hover_height_range_override = (lo, hi)
+
+    def set_fixed_hover_height(self, height: float) -> None:
+        """把悬停目标高度固定为单一值。"""
+        h = float(height)
+        self.set_hover_height_range(h, h)
+        self.set_hover_height(h)
+
 
 class HoverStrategyMixin:
     """悬停类策略的场景/目标辅助逻辑；奖励由具体阶段实现。"""
 
     hover_stage = True
+    HOVER_HEIGHT_MIN = 1.0
+    HOVER_HEIGHT_MAX = 10.0
+
+    def _hover_height_bounds(self) -> Tuple[float, float]:
+        override = getattr(self, "_hover_height_range_override", None)
+        if override is not None:
+            return override
+        return float(self.HOVER_HEIGHT_MIN), float(self.HOVER_HEIGHT_MAX)
+
+    def _sample_hover_height(self, rng: np.random.Generator) -> float:
+        lo, hi = self._hover_height_bounds()
+        if lo == hi:
+            return float(lo)
+        return float(rng.uniform(lo, hi))
+
+    def _apply_hover_height(self, env: Any, height: float) -> None:
+        height = float(height)
+        self.set_hover_height(height)
+        env._current_hover_height = height
 
     def _setup_hover_scene(
         self, env: Any, rng: np.random.Generator, motion_strategy: MotionStrategy,
     ) -> None:
-        cfg = self.config.episode
-        height = float(rng.uniform(cfg.hover_height_min, cfg.hover_height_max))
-        self.set_hover_height(height)
-        env._current_hover_height = height
+        self._apply_hover_height(env, self._sample_hover_height(rng))
         env._platform.set_motion_strategy(motion_strategy)
 
     def get_target_pos(self, platform_pos: np.ndarray) -> np.ndarray:

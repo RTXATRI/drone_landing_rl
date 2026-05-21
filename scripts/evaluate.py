@@ -476,23 +476,18 @@ def _resolve_eval_float(
     return _prompt_positive_float(label, default, unit)
 
 
-def apply_eval_control_config(
+def apply_eval_capability_config(
     env_config: EnvConfig,
-    hover_height: float,
     eval_v_xy_max: float,
     eval_v_z_up_max: float,
     eval_v_z_down_max: float,
 ) -> None:
-    """将固定悬停目标和速度能力应用到该评估配置。"""
-    hover_height = _positive_finite_float(hover_height, "hover_height")
+    """将固定速度能力应用到该评估配置。"""
     eval_v_xy_max = _positive_finite_float(eval_v_xy_max, "eval_v_xy_max")
     eval_v_z_up_max = _positive_finite_float(eval_v_z_up_max, "eval_v_z_up_max")
     eval_v_z_down_max = _positive_finite_float(eval_v_z_down_max, "eval_v_z_down_max")
     if eval_v_z_down_max > eval_v_z_up_max:
         raise ValueError("eval_v_z_down_max 不能大于 eval_v_z_up_max。")
-
-    env_config.episode.hover_height_min = hover_height
-    env_config.episode.hover_height_max = hover_height
 
     oc = env_config.observation
     oc.v_xy_min = eval_v_xy_max
@@ -549,9 +544,8 @@ def resolve_eval_controls(args: argparse.Namespace, env_config: EnvConfig, stage
         print(f"输入无效：{msg}")
 
     try:
-        apply_eval_control_config(
+        apply_eval_capability_config(
             env_config,
-            hover_height=hover_height,
             eval_v_xy_max=eval_v_xy_max,
             eval_v_z_up_max=eval_v_z_up_max,
             eval_v_z_down_max=eval_v_z_down_max,
@@ -608,9 +602,12 @@ def evaluate_stage(
 ) -> dict:
     """运行 n_episodes 次确定性 rollout，并返回汇总统计。"""
     render_mode = "human" if render else None
+    strategy = create_strategy(stage, env_config)
+    if is_hover_stage(stage) and hover_height is not None:
+        strategy.set_fixed_hover_height(hover_height)
     env = DroneLandingEnv(
         env_config,
-        strategy=create_strategy(stage, env_config),
+        strategy=strategy,
         render_mode=render_mode,
     )
     if is_hover_stage(stage):

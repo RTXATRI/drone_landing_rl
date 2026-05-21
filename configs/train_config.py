@@ -25,7 +25,7 @@ class SACConfig:
     use_sde: bool = False
 
     # 学习率三段式衰减：恒定(满LR) → 余弦衰减 → 平坦(最低LR)
-    lr_decay: bool = True                 # 启用学习率衰减
+    lr_decay: bool = False                 # 启用学习率衰减
     lr_decay_start: float = 0.30           # 段1→段2 分界（已完成进度，例：0.50=完成50%时开始衰减）
     lr_decay_end: float = 0.60            # 段2→段3 分界（已完成进度，例：0.80=完成80%时进入平坦）
     lr_decay_min_ratio: float = 0.5       # 最低 LR 占 learning_rate 的比例
@@ -49,13 +49,12 @@ class CurriculumConfig:
     """
     window_size: int = 30            # 滚动成功率使用的 episode 窗口
     eval_freq: int = 8_000           # 两次课程指标检查之间的步数
-
     max_stage: int = 4                 # 本次运行允许手动到达的最高阶段
 
     # 已注册课程的预算步数（可通过 CLI --total_steps 覆盖）
     stage_timesteps: List[int] = field(default_factory=lambda: [
         60_000_000,
-        20_000_000,
+        60_000_000,
         30_000_000,
         30_000_000,
     ])

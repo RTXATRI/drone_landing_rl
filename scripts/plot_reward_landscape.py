@@ -89,21 +89,21 @@ def stage1_vel_gate(h, v):
 # ── r_approach：反二次（长尾） ──
 POS_APPROACH_WEIGHT   = 2.5   # 峰值权重
 POS_APPROACH_SIGMA_XY = 8.0   # 水平半衰半径 (m)
-POS_APPROACH_SIGMA_Z  = 8.0   # 垂直半衰半径 (m)
+POS_APPROACH_SIGMA_Z  = 5.0   # 垂直半衰半径 (m)
 
 # ── r_precise：高斯（中距精度） ──
 POS_PRECISE_WEIGHT   = 1.5    # 近距精度权重
 POS_PRECISE_SIGMA_XY = 1.0    # 近距水平 σ (m)
-POS_PRECISE_SIGMA_Z  = 1.0    # 近距垂直 σ (m)
+POS_PRECISE_SIGMA_Z  = 0.5    # 近距垂直 σ (m)
 
 # ── r_peak：窄高斯（近距峰值） ──
-POS_PEAK_WEIGHT   = 1.0       # 峰值权重
+POS_PEAK_WEIGHT   = 2.0       # 峰值权重
 POS_PEAK_SIGMA_XY = 0.25      # 峰值水平 σ (m)
 POS_PEAK_SIGMA_Z  = 0.25      # 峰值垂直 σ (m)
 
 POS_PEAK_WEIGHT2   = 0.5       # 峰值权重
-POS_PEAK_SIGMA_XY2 = 0.04      # 峰值水平 σ (m)
-POS_PEAK_SIGMA_Z2  = 0.04      # 峰值垂直 σ (m)
+POS_PEAK_SIGMA_XY2 = 0.12      # 峰值水平 σ (m)
+POS_PEAK_SIGMA_Z2  = 0.08      # 峰值垂直 σ (m)
 
 # ── vel_match gate ──
 VEL_MATCH_GATE_INNER = 0.10   # 全惩罚内阈值 (m)
@@ -297,7 +297,10 @@ def main():
         plot_stage(STAGE_CONFIGS[sid], VIEW)
         plot_stage_slices(STAGE_CONFIGS[sid], VIEW)
 
-    plt.show()
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

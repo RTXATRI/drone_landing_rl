@@ -36,7 +36,7 @@ from curriculum.strategies import create_strategy
 from envs.drone_landing_env import DroneLandingEnv
 from envs.landing_platform.moving_platform import MovingPlatform
 from envs.landing_platform.motions import LissajousMotion, PatrolMotion, WaypointMotion
-from scripts.evaluate import apply_eval_control_config
+from scripts.evaluate import apply_eval_capability_config
 from training.trainer import EPISODE_INFO_KEYWORDS, Trainer
 
 PASS = "  [PASS]"
@@ -1320,15 +1320,16 @@ def test_eval_fixed_controls_config() -> bool:
     _header("Test 23: Eval Fixed Controls")
     ok = True
     cfg = EnvConfig()
-    apply_eval_control_config(
+    apply_eval_capability_config(
         cfg,
-        hover_height=5.0,
         eval_v_xy_max=10.0,
         eval_v_z_up_max=3.0,
         eval_v_z_down_max=2.0,
     )
 
-    env = _make_env(cfg, stage=1)
+    strategy = create_strategy(1, cfg)
+    strategy.set_fixed_hover_height(5.0)
+    env = DroneLandingEnv(cfg, strategy=strategy)
     obs, _ = env.reset(seed=151)
     ps = env._get_platform_state()
     target = env._get_target_pos(ps["position"])
@@ -1346,10 +1347,20 @@ def test_eval_fixed_controls_config() -> bool:
                  "capability observation slots match fixed eval caps")
     env.close()
 
+    strategy = create_strategy(2, cfg)
+    strategy.set_fixed_hover_height(5.0)
+    env = DroneLandingEnv(cfg, strategy=strategy)
+    env.reset(seed=152)
+    ps = env._get_platform_state()
+    target = env._get_target_pos(ps["position"])
+    hover_height = float(target[2] - ps["position"][2])
+    ok &= _check(np.isclose(hover_height, 5.0),
+                 f"Stage-2 eval hover height is fixed at 5m  [got {hover_height:.2f}]")
+    env.close()
+
     try:
-        apply_eval_control_config(
+        apply_eval_capability_config(
             EnvConfig(),
-            hover_height=5.0,
             eval_v_xy_max=10.0,
             eval_v_z_up_max=2.0,
             eval_v_z_down_max=3.0,

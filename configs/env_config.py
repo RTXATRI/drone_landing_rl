@@ -1,9 +1,9 @@
-# 功能：定义无人机降落环境的物理参数、观测归一化参数和奖励权重。
+# 功能：定义无人机降落环境的物理参数、观测归一化参数和生命周期参数。
 """
 环境配置 dataclass。
 
-所有物理常量和环境参数都集中在这里。
-调环境参数时，优先只修改这个文件。
+这里仅放环境物理、观测归一化和 episode 生命周期参数。
+课程目标、平台运动选择和奖励参数由具体课程策略维护。
 """
 
 from dataclasses import dataclass, field
@@ -85,7 +85,7 @@ class ObservationConfig:
 
 @dataclass
 class PlatformConfig:
-    """降落平台几何尺寸和运动参数。"""
+    """降落平台几何尺寸和降落容差。"""
     # 几何尺寸（半长，单位 m）
     half_extents: Tuple[float, float, float] = (0.6, 0.6, 0.08)
 
@@ -93,12 +93,6 @@ class PlatformConfig:
     landing_radius: float = 0.55   # 水平容差 (m)
     landing_height_tol: float = 0.20  # 平台中心上方垂直容差 (m)
     landing_speed_max: float = 0.35   # 接触瞬间最大速度 (m/s)
-
-    # 可被课程策略选择使用的平台运动参数
-    max_speed: float = 1.0           # m/s（用于归一化）
-    motion_amplitude_x: float = 2.0  # m
-    motion_amplitude_y: float = 1.0  # m
-    motion_frequency: float = 0.15   # Hz
 
 
 @dataclass
@@ -116,10 +110,6 @@ class EpisodeConfig:
     # 终止边界
     max_horiz_dist: float = 45.0   # 无人机水平漂移超过该距离则结束 episode
     min_height: float = -0.3       # 无人机低于地面则结束 episode
-
-    # 可被悬停类策略使用的目标高度范围（每个 episode 随机）
-    hover_height_min: float = 1.0      # 最小悬停目标高度 (m)
-    hover_height_max: float = 10.0     # 最大悬停目标高度 (m)
 
 
 @dataclass
