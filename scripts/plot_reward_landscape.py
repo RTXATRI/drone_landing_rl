@@ -92,51 +92,37 @@ POS_APPROACH_SIGMA_XY = 5.0   # 水平半衰半径 (m)
 POS_APPROACH_SIGMA_Z  = 3.0   # 垂直半衰半径 (m)
 
 # ── r_precise：高斯（中距精度） ──
-POS_PRECISE_WEIGHT   = 1.5    # 近距精度权重
-POS_PRECISE_SIGMA_XY = 1.0    # 近距水平 σ (m)
-POS_PRECISE_SIGMA_Z  = 1.0    # 近距垂直 σ (m)
+AGS_1_WEIGHT   = 1.5    # 近距精度权重
+AGS_1_SIGMA_XY = 0.5    # 近距水平 σ (m)
+AGS_1_SIGMA_Z  = 0.5    # 近距垂直 σ (m)
 
 # ── r_peak：窄高斯（近距峰值） ──
-POS_PEAK_WEIGHT   = 1.5       # 峰值权重
-POS_PEAK_SIGMA_XY = 0.25      # 峰值水平 σ (m)
-POS_PEAK_SIGMA_Z  = 0.25      # 峰值垂直 σ (m)
+AGS_2_WEIGHT   = 1.5       # 峰值权重
+AGS_2_SIGMA_XY = 0.20      # 峰值水平 σ (m)
+AGS_2_SIGMA_Z  = 0.20      # 峰值垂直 σ (m)
 
-POS_PEAK_WEIGHT2   = 1.0       # 峰值权重
-POS_PEAK_SIGMA_XY2 = 0.10      # 峰值水平 σ (m)
-POS_PEAK_SIGMA_Z2  = 0.10      # 峰值垂直 σ (m)
+AGS_3_WEIGHT   = 1.0       # 峰值权重
+AGS_3_SIGMA_XY = 0.05      # 峰值水平 σ (m)
+AGS_3_SIGMA_Z  = 0.05      # 峰值垂直 σ (m)
 
 # ── vel_match gate ──
 VEL_MATCH_GATE_INNER = 0.10   # 全惩罚内阈值 (m)
 VEL_MATCH_GATE_OUTER = 0.50   # 零惩罚外阈值 (m)
 
+# 二元各向异性柯西加权函数模板
+def r_anisotropic_cauchy(h, v, weight, sigma_xy, sigma_z):
+    return weight / ( 1.0 + (h / sigma_xy) ** 2 + (v / sigma_z) ** 2 )
 
-def stage2_r_approach(h, v):
-    return POS_APPROACH_WEIGHT / (
-        1.0
-        + (h / POS_APPROACH_SIGMA_XY) ** 2
-        + (v / POS_APPROACH_SIGMA_Z) ** 2
-    )
-
-def stage2_r_precise(h, v):
-    return POS_PRECISE_WEIGHT * np.exp(
-        -(h ** 2) / (2.0 * POS_PRECISE_SIGMA_XY ** 2)
-        - (v ** 2) / (2.0 * POS_PRECISE_SIGMA_Z ** 2)
-    )
-
-def stage2_r_peak(h, v):
-    return POS_PEAK_WEIGHT * np.exp(
-        -(h ** 2) / (2.0 * POS_PEAK_SIGMA_XY ** 2)
-        - (v ** 2) / (2.0 * POS_PEAK_SIGMA_Z ** 2)
-    )
-
-def stage2_r_peak_2(h, v):
-    return POS_PEAK_WEIGHT2 * np.exp(
-        -(h ** 2) / (2.0 * POS_PEAK_SIGMA_XY2 ** 2)
-        - (v ** 2) / (2.0 * POS_PEAK_SIGMA_Z2 ** 2)
-    )
+# 各向异性高斯函数模板
+def r_anisotropic_gaussian(h, v, weight, sigma_xy, sigma_z):
+    return weight * np.exp( -(h ** 2) / (2.0 * sigma_xy ** 2) - (v ** 2) / (2.0 * sigma_z ** 2))
 
 def stage2_r_pos_total(h, v):
-    return stage2_r_approach(h, v) + stage2_r_precise(h, v) + stage2_r_peak(h, v) + stage2_r_peak_2(h, v)
+    return (r_anisotropic_cauchy(h, v, POS_APPROACH_WEIGHT, POS_APPROACH_SIGMA_XY, POS_APPROACH_SIGMA_Z)
+            + r_anisotropic_gaussian(h, v, AGS_1_WEIGHT, AGS_1_SIGMA_XY, AGS_1_SIGMA_Z)
+            + r_anisotropic_gaussian(h, v, AGS_2_WEIGHT, AGS_2_SIGMA_XY, AGS_2_SIGMA_Z)
+            + r_anisotropic_gaussian(h, v, AGS_3_WEIGHT, AGS_3_SIGMA_XY, AGS_3_SIGMA_Z)
+            )
 
 def stage2_vel_match_gate(h):
     return smoothstep(

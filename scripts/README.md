@@ -34,7 +34,7 @@ conda run --no-capture-output -n drone_rl python scripts\train.py
 | `--best_grid_count` | `20` | `--best_grid_count 20` | 每阶段等间距采样候选数量，不含起点、包含阶段末尾 |
 | `--best_interval_top_m` | `5` | `--best_interval_top_m 5` | 每个等间距区间内按训练 episode reward 额外保留的峰值候选数 |
 | `--best_eval_episodes` | `50` | `--best_eval_episodes 50` | 每个候选最终复评的 episode 数 |
-| `--best_eval_envs` | `1=50,2=50,3=50,4=50` | `--best_eval_envs 1=50,2=50,3=32` | 最佳模型复评时各阶段使用的并行环境数 |
+| `--best_eval_envs` | `1=50,2=50,3=50,4=50` | `--best_eval_envs 1=50,2=56,3=32` | 最佳模型复评时各阶段使用的总环境预算，按 10 向下取整且最小为 10 |
 
 ### 常用命令示例
 

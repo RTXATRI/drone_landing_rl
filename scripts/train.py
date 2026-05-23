@@ -57,7 +57,10 @@ def _parse_stage_envs(value: str) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    from configs.train_config import TrainConfig
+    from configs.train_config import (
+        TrainConfig,
+        normalize_best_model_eval_envs_by_stage,
+    )
     from curriculum.strategies import registered_stage_ids
 
     defaults = TrainConfig()
@@ -118,7 +121,7 @@ def parse_args() -> argparse.Namespace:
                    help="Episodes per candidate in final best-model evaluation")
     p.add_argument("--best_eval_envs", type=_parse_stage_envs,
                    default=dict(defaults.best_model_eval_envs_by_stage),
-                   help="Per-stage parallel eval envs, e.g. 1=50,2=50,3=32")
+                   help="Per-stage total eval env budget, rounded down to 10s, e.g. 1=50,2=56")
     p.add_argument("--best_keep_top_n", type=int,
                    default=defaults.best_model_keep_top_n,
                    help="Number of final top models to keep after best-model evaluation")
@@ -155,7 +158,7 @@ def parse_args() -> argparse.Namespace:
         p.error(f"--best_eval_envs contains unknown stages: {unknown_best_eval_stages}")
     merged_best_eval_envs = dict(defaults.best_model_eval_envs_by_stage)
     merged_best_eval_envs.update(args.best_eval_envs)
-    args.best_eval_envs = merged_best_eval_envs
+    args.best_eval_envs = normalize_best_model_eval_envs_by_stage(merged_best_eval_envs)
     return args
 
 

@@ -417,37 +417,37 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         rel_speed = float(np.linalg.norm(rel_vel))
         plat_speed = float(np.linalg.norm(plat_vel))
 
-        # ── 位置奖励 r_pos ：三层叠加 ──
-        # 反二次分量：长尾，提供远距离梯度
+        # ── 位置奖励 r_pos ：四层叠加 ──
+        # r_approach：米级远距接近梯度，保证远离目标时仍有方向性。
         POS_APPROACH_WEIGHT = 3.0
-        POS_APPROACH_SIGMA_XY = 8.0     # 远距离水平 σ (m)
-        POS_APPROACH_SIGMA_Z = 5.0      # 远距离垂直 σ (m)
-        r_approach = POS_APPROACH_WEIGHT / (
-            1.0
-            + (horiz_err / POS_APPROACH_SIGMA_XY) ** 2
-            + (vert_err / POS_APPROACH_SIGMA_Z) ** 2
-        )
+        POS_APPROACH_SIGMA_XY = 5.0     # 米级水平半衰尺度 (m)
+        POS_APPROACH_SIGMA_Z = 3.0      # 米级垂直半衰尺度 (m)
 
-        # 高斯分量：中距精度
-        POS_PRECISE_WEIGHT = 3.0        # 近距精度权重
-        POS_PRECISE_SIGMA_XY = 1.0      # 近距水平 σ (m)
-        POS_PRECISE_SIGMA_Z = 0.5       # 近距垂直 σ (m)
-        r_precise = POS_PRECISE_WEIGHT * float(np.exp(
-            -(horiz_err ** 2) / (2.0 * POS_PRECISE_SIGMA_XY ** 2)
-            - (vert_err ** 2) / (2.0 * POS_PRECISE_SIGMA_Z ** 2)
-        ))
+        r_approach = POS_APPROACH_WEIGHT / ( 1.0 + (horiz_err / POS_APPROACH_SIGMA_XY) ** 2 + (vert_err / POS_APPROACH_SIGMA_Z) ** 2)
 
-        # 高斯分量：近距峰值，兼顾厘米级精修与 0.20~0.30m 区间梯度
-        POS_PEAK_WEIGHT = 2.0           # 峰值权重
-        POS_PEAK_SIGMA_XY = 0.12        # 峰值水平 σ (m)
-        POS_PEAK_SIGMA_Z = 0.08         # 峰值垂直 σ (m)
-        r_peak = POS_PEAK_WEIGHT * float(np.exp(
-            -(horiz_err ** 2) / (2.0 * POS_PEAK_SIGMA_XY ** 2)
-            - (vert_err ** 2) / (2.0 * POS_PEAK_SIGMA_Z ** 2)
-        ))
+        # r_mid_precision：约 1m 尺度的中距精度梯度。
+        POS_MID_PRECISION_WEIGHT = 1.5
+        POS_MID_PRECISION_SIGMA_XY = 0.5
+        POS_MID_PRECISION_SIGMA_Z = 0.5
 
-        # 计算位置奖励总和
-        r_pos = r_approach + r_precise + r_peak
+        r_mid_precision = POS_MID_PRECISION_WEIGHT * float(np.exp( -(horiz_err ** 2) / (2.0 * POS_MID_PRECISION_SIGMA_XY ** 2) - (vert_err ** 2) / (2.0 * POS_MID_PRECISION_SIGMA_Z ** 2)))
+
+        # r_near_peak：约 0.20~0.30m 尺度的近距峰值，提供分米级收敛梯度。
+        POS_NEAR_PEAK_WEIGHT = 1.5
+        POS_NEAR_PEAK_SIGMA_XY = 0.20
+        POS_NEAR_PEAK_SIGMA_Z = 0.20
+
+        r_near_peak = POS_NEAR_PEAK_WEIGHT * float(np.exp( -(horiz_err ** 2) / (2.0 * POS_NEAR_PEAK_SIGMA_XY ** 2) - (vert_err ** 2) / (2.0 * POS_NEAR_PEAK_SIGMA_Z ** 2)))
+
+        # r_centimeter_refine：约 0.10m 尺度的厘米级精修峰值。
+        POS_CENTIMETER_REFINE_WEIGHT = 1.0
+        POS_CENTIMETER_REFINE_SIGMA_XY = 0.05
+        POS_CENTIMETER_REFINE_SIGMA_Z = 0.05
+
+        r_centimeter_refine = POS_CENTIMETER_REFINE_WEIGHT * float(np.exp( -(horiz_err ** 2) / (2.0 * POS_CENTIMETER_REFINE_SIGMA_XY ** 2) - (vert_err ** 2) / (2.0 * POS_CENTIMETER_REFINE_SIGMA_Z ** 2)))
+
+        # 计算位置奖励总和，中心峰值为 7.0。
+        r_pos = r_approach + r_mid_precision + r_near_peak + r_centimeter_refine
 
         # ── 远距相对闭合速度奖励 ──
         CLOSING_WEIGHT = 0.50
@@ -474,8 +474,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         VEL_MATCH_Z_GATE_INNER = 0.10     # Z 速度惩罚全开垂直误差阈值 (m)
         VEL_MATCH_Z_GATE_OUTER = 0.30     # Z 速度惩罚全关垂直误差阈值 (m)
         VEL_MATCH_EPS = 1e-6              # 避免归一化除零
-        VEL_MATCH_XY_WEIGHT = 0.20        # XY 误差修正速度惩罚权重
-        VEL_MATCH_Z_WEIGHT = 0.30         # Z 误差修正速度惩罚权重
+        VEL_MATCH_XY_WEIGHT = 0.20        # XY 速度惩罚权重
+        VEL_MATCH_Z_WEIGHT = 0.25         # Z 速度惩罚权重
         VEL_CORR_GAIN_X = 0.7             # X 轴位置误差到期望相对速度的比例增益
         VEL_CORR_GAIN_Y = 0.7             # Y 轴位置误差到期望相对速度的比例增益
         VEL_CORR_GAIN_Z = 0.6             # Z 轴位置误差到期望相对速度的比例增益
@@ -516,21 +516,9 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
                 return 0.5 * norm_error ** 2
             return norm_error - 0.5
 
-        vel_rel_des_x = float(np.clip(
-            -VEL_CORR_GAIN_X * float(rel_pos[0]),
-            -VEL_CORR_MAX_X,
-            VEL_CORR_MAX_X,
-        ))
-        vel_rel_des_y = float(np.clip(
-            -VEL_CORR_GAIN_Y * float(rel_pos[1]),
-            -VEL_CORR_MAX_Y,
-            VEL_CORR_MAX_Y,
-        ))
-        vel_rel_des_z = float(np.clip(
-            -VEL_CORR_GAIN_Z * float(rel_pos[2]),
-            -VEL_CORR_MAX_Z,
-            VEL_CORR_MAX_Z,
-        ))
+        vel_rel_des_x = float(np.clip( -VEL_CORR_GAIN_X * float(rel_pos[0]), -VEL_CORR_MAX_X, VEL_CORR_MAX_X,))
+        vel_rel_des_y = float(np.clip( -VEL_CORR_GAIN_Y * float(rel_pos[1]), -VEL_CORR_MAX_Y, VEL_CORR_MAX_Y,))
+        vel_rel_des_z = float(np.clip( -VEL_CORR_GAIN_Z * float(rel_pos[2]), -VEL_CORR_MAX_Z, VEL_CORR_MAX_Z,))
 
         vel_err_x = float(rel_vel[0]) - vel_rel_des_x
         vel_err_y = float(rel_vel[1]) - vel_rel_des_y
@@ -563,16 +551,10 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         ACTION_SMOOTH_WEIGHT = 0.10   # 动作变化惩罚权重
         ACTION_MAG_WEIGHT = 0.01      # 动作幅值惩罚权重
         action_delta = action - prev_action
-        r_action = (
-            -ACTION_SMOOTH_WEIGHT * float(np.sum(action_delta ** 2))
-            -ACTION_MAG_WEIGHT * float(np.sum(action ** 2))
-        )
+        r_action = ( -ACTION_SMOOTH_WEIGHT * float(np.sum(action_delta ** 2)) -ACTION_MAG_WEIGHT * float(np.sum(action ** 2)))
 
         # 计算总奖励
-        total = (
-            r_pos + r_closing + r_vel_match + r_yaw + r_yaw_rate
-            + r_action
-        )
+        total = r_pos + r_closing + r_vel_match + r_yaw + r_yaw_rate + r_action
 
         # 速度修正诊断：
         #   vel_rel_des_* 表示由位置误差给出的期望相对速度。
@@ -580,7 +562,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
         #   vel_err_norm_* 表示按各轴速度误差尺度归一化后的残差。
         info = {
             "reward/pos": r_pos,
-            "reward/peak": r_peak,
+            "reward/near_peak": r_near_peak,
+            "reward/cm_refine": r_centimeter_refine,
             "reward/closing": r_closing,
             "reward/vel_match": r_vel_match,
             "reward/vel_match_xy": r_vel_xy,
@@ -640,7 +623,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
     def reward_log_columns(self) -> Tuple[str, ...]:
         return (
             "timestep", "stage", "reward_total",
-            "reward_pos", "reward_peak", "reward_vel_match",
+            "reward_pos", "reward_near_peak", "reward_cm_refine",
+            "reward_vel_match",
             "reward_yaw", "reward_yaw_rate", "reward_action",
             "metric_dist", "metric_horiz_err", "metric_vert_err",
             "metric_speed", "metric_rel_speed", "metric_plat_speed",
@@ -653,7 +637,8 @@ class Stage2HoverMovingStrategy(HoverStrategyMixin, CurriculumStrategy):
             "stage": int(info.get("stage", self.stage_id())),
             "reward_total": round(info.get("reward/total", 0.0), 5),
             "reward_pos": round(info.get("reward/pos", 0.0), 5),
-            "reward_peak": round(info.get("reward/peak", 0.0), 5),
+            "reward_near_peak": round(info.get("reward/near_peak", 0.0), 5),
+            "reward_cm_refine": round(info.get("reward/cm_refine", 0.0), 5),
             "reward_vel_match": round(info.get("reward/vel_match", 0.0), 5),
             "reward_yaw": round(info.get("reward/yaw", 0.0), 5),
             "reward_yaw_rate": round(info.get("reward/yaw_rate", 0.0), 5),

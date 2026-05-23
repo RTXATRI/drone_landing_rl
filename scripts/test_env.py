@@ -843,8 +843,8 @@ def test_stage2_strategy_reward_shape() -> bool:
     _, closing_near = _info_at([0.5, 0.0, 5.0], velocity=(-1.0, 0.0, 0.0))
 
     # 位置奖励在目标中心处最大
-    ok &= _check(center["reward/pos"] >= 7.0,
-                 f"Stage 2 target-center position reward is strong  [got {center['reward/pos']:.4f}]")
+    ok &= _check(np.isclose(center["reward/pos"], 7.0, atol=1e-6),
+                 f"Stage 2 target-center position reward peak is 7.0  [got {center['reward/pos']:.4f}]")
     # 位置奖励随距离单调衰减
     ok &= _check(center["reward/pos"] > near["reward/pos"] > mid["reward/pos"],
                  "Stage 2 position reward decays with distance from target")
@@ -857,7 +857,7 @@ def test_stage2_strategy_reward_shape() -> bool:
     )
     ok &= _check(center["reward/pos"] - one_cm["reward/pos"] >= 0.006,
                  f"Stage 2 1cm position gap remains meaningful  [got {center['reward/pos'] - one_cm['reward/pos']:.5f}]")
-    ok &= _check(ten_cm["reward/pos"] - twenty_cm["reward/pos"] >= 0.80,
+    ok &= _check(ten_cm["reward/pos"] - twenty_cm["reward/pos"] >= 0.75,
                  f"Stage 2 10cm-to-20cm position gradient is not flat  [got {ten_cm['reward/pos'] - twenty_cm['reward/pos']:.5f}]")
     ok &= _check(twenty_cm["reward/pos"] - near["reward/pos"] >= 0.40,
                  f"Stage 2 20cm-to-30cm position gradient is not flat  [got {twenty_cm['reward/pos'] - near['reward/pos']:.5f}]")
@@ -967,14 +967,17 @@ def test_stage2_strategy_reward_shape() -> bool:
     ok &= _check(abs(closing_near["reward/closing"]) < 1e-6,
                  f"Stage 2 closing reward is off near target  [got {closing_near['reward/closing']:.4f}]")
 
-    # peak 层在 <0.15m 提供非零梯度
-    ok &= _check(center["reward/peak"] > near["reward/peak"],
-                 f"Stage 2 peak reward provides gradient at close range")
+    # 近距峰值和厘米级精修分别暴露，便于独立诊断。
+    ok &= _check(center["reward/near_peak"] > near["reward/near_peak"],
+                 "Stage 2 near_peak reward provides decimeter-scale gradient")
+    ok &= _check(center["reward/cm_refine"] > ten_cm["reward/cm_refine"] > near["reward/cm_refine"],
+                 "Stage 2 cm_refine reward provides centimeter-scale gradient")
 
     # 必需 info 键存在
     expected_keys = {
-        "reward/pos", "reward/peak", "reward/closing", "reward/vel_match", "reward/yaw",
+        "reward/pos", "reward/closing", "reward/vel_match", "reward/yaw",
         "reward/yaw_rate", "reward/action", "reward/total",
+        "reward/near_peak", "reward/cm_refine",
         "reward/vel_match_xy", "reward/vel_match_z",
         "metric/dist", "metric/horiz_err", "metric/vert_err",
         "metric/speed", "metric/rel_speed", "metric/plat_speed",
@@ -1087,7 +1090,7 @@ def test_hold_reward_space_independence() -> bool:
     ok &= _check(_stage1_counts(stage1_xy_bad) == (0, 0),
                  "Stage 1 score rejects excessive horizontal speed")
 
-    # Stage 2: peak 层在 <0.15m 提供非零连续梯度。
+    # Stage 2: 近距峰值和厘米级精修分别提供连续梯度。
     s2 = create_strategy(2, cfg)
     env2 = _env()
     target2 = np.array([0.0, 0.0, 5.0], dtype=np.float32)
@@ -1119,10 +1122,18 @@ def test_hold_reward_space_independence() -> bool:
     s2_center = _reward_info(s2, env2, at_center, platform2, target2, hold_steps=0)
     s2_0d1m = _reward_info(s2, env2, at_0d1m, platform2, target2, hold_steps=0)
     s2_0d3m = _reward_info(s2, env2, at_0d3m, platform2, target2, hold_steps=0)
-    ok &= _check(s2_center["reward/peak"] > s2_0d1m["reward/peak"] > s2_0d3m["reward/peak"],
-                 "Stage 2 peak reward provides continuous gradient at close range")
-    ok &= _check(s2_center["reward/peak"] > 0.5,
-                 f"Stage 2 peak reward at center is significant  [got {s2_center['reward/peak']:.4f}]")
+    ok &= _check(
+        s2_center["reward/near_peak"] > s2_0d1m["reward/near_peak"] > s2_0d3m["reward/near_peak"],
+        "Stage 2 near_peak reward provides continuous gradient at close range",
+    )
+    ok &= _check(
+        s2_center["reward/cm_refine"] > s2_0d1m["reward/cm_refine"] > s2_0d3m["reward/cm_refine"],
+        "Stage 2 cm_refine reward provides continuous gradient at close range",
+    )
+    ok &= _check(s2_center["reward/near_peak"] > 0.5,
+                 f"Stage 2 near_peak reward at center is significant  [got {s2_center['reward/near_peak']:.4f}]")
+    ok &= _check(s2_center["reward/cm_refine"] > 0.5,
+                 f"Stage 2 cm_refine reward at center is significant  [got {s2_center['reward/cm_refine']:.4f}]")
     s2.update_step_metrics(env2, at_0d1m, platform2, target2)
     ok &= _check(env2._stage2_train_hit_steps == 1 and env2._stage2_eval_hold_steps == 0,
                  "Stage 2 train_score space can differ from eval hold space")

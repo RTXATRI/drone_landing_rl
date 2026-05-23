@@ -58,9 +58,21 @@ conda run --no-capture-output -n drone_rl python scripts\train.py --stage 2 --mi
 
 阶段正常结束后，默认会进行最佳模型自动筛选。每个阶段先按训练预算分成 `best_grid_count` 个区间，保存每个区间终点的 grid candidate；每个区间内再按训练 rollout 的 episode reward 保留 `best_interval_top_m` 个峰值候选。默认候选上限为 `20 + 20*5 = 120`。训练中的 `train_score` 受 SAC 探索影响较大，因此只用于最终复评统计，不用于训练中入围判断。
 
-最佳模型复评会在阶段 `model.learn()` 正常结束后运行；`Ctrl+C` 或异常中断不会触发当前阶段复评。复评对所有候选使用同一组随机 seed，评估时使用 deterministic action，并按 `combined_score = avg_train_score * 0.3 + avg_eval_score * 0.7` 排序。
+最佳模型复评会在阶段 `model.learn()` 正常结束后运行；`Ctrl+C` 或异常中断不会触发当前阶段复评。复评使用三轮筛选：所有候选先评估 10 个 episode，入围候选再评估 20 个 episode，最终入围候选再额外评估 `best_model_eval_episodes` 个 episode。后续轮次的均分和 fail 标记都累计前面轮次的结果。复评会按 `best_model_eval_envs_by_stage` 指定的总 env 预算批量并发评估候选；预算按 10 向下取整且最小为 10，每个候选占用 10 个 env。
 
-任意评估 episode 出现 `oob`、`below_ground` 或 `crashed` 时，该候选标记为 `fail`；普通低分或 `success=False` 不直接等同于失败行为。排序时 `clean` 模型优先，`clean` 内按综合分降序。
+综合分使用百分制指标加权：
+
+```text
+combined_score =
+    0.20 * avg_train_score
+  + 0.30 * avg_eval_score
+  + 0.35 * avg_min_dist_score
+  + 0.15 * min_dist_score
+```
+
+`min_dist_score` 使用 `zero=0.050m`，`avg_min_dist_score` 使用 `zero=0.150m`。同一轮内所有候选使用相同 seed 序列，不同轮使用不同 seed block，评估时使用 deterministic action。
+
+任意评估 episode 出现 `oob`、`below_ground` 或 `crashed` 时，该候选累计标记为 `fail`；普通低分或 `success=False` 不直接等同于失败行为。前两轮按累计综合分和 fail 规则筛选入围；最终保存 top model 时仍按 `clean` 优先、失败次数更少优先、综合分更高优先的顺序排名。
 
 最佳模型输出：
 
